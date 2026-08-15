@@ -1,8 +1,8 @@
 # AutoCommentReply
 
-自动读取视频评论，并在后续里程碑中按需回复的自动化项目。当前只实现 **MVP1：完整、只读地抽取一条 Bilibili 视频当前可见的评论，并还原成评论树与根到叶对话链**。
+自动读取视频评论，并在后续里程碑中按需回复的自动化项目。当前已完成 **MVP1：完整、只读地抽取一条 Bilibili 视频当前可见的评论，并还原成评论树与根到叶对话链**。
 
-> 当前状态：MVP1 已有可运行的 Python 实现和离线测试。AI、数据库、自动回复、前端仍明确不在当前范围内。
+> 当前状态：MVP1 已完成，但当前代码能力仍只有只读 MVP1。AI、数据库、自动回复、前端仍明确未实现。
 
 ## 这个项目想做什么
 
@@ -12,7 +12,7 @@
 读取评论 → SQLite 增量去重 → AI 决策与生成 → 人工审核 → 自动回复
 ```
 
-当前只完成第一段的数据基础：
+当前已完成第一段的数据基础：
 
 - 使用 B 站网页当前实际使用的评论接口，不依赖第三方爬虫框架。
 - 完整翻完主评论和每个根评论下的楼中楼分页。
@@ -27,9 +27,11 @@
 
 需要 Python 3.11 或更高版本，推荐使用 [uv](https://docs.astral.sh/uv/) 管理环境。
 
+以下示例中的 `YOUR_BVID` 需要替换为目标视频的 BV 号。
+
 ```powershell
 uv sync --dev
-uv run auto-comment-reply BV13YBpBCEE2 -o comments.json
+uv run auto-comment-reply YOUR_BVID -o comments.json
 ```
 
 也可以传入：
@@ -43,7 +45,7 @@ uv run auto-comment-reply BV13YBpBCEE2 -o comments.json
 不带 Cookie 时，程序读取匿名账号当前可见的数据。需要登录可见范围时，推荐把 Cookie 放进工作区之外的本机私有文件：
 
 ```powershell
-uv run auto-comment-reply BV13YBpBCEE2 `
+uv run auto-comment-reply YOUR_BVID `
   --cookie-file C:\private\bilibili.cookie `
   -o comments.json
 ```
@@ -134,24 +136,16 @@ uv run pytest --cov=auto_comment_reply --cov-report=term-missing
 | 文档 | 作用 |
 | --- | --- |
 | [AGENTS.md](AGENTS.md) | 编码 Agent 的范围规则 |
-| [docs/PROJECT.md](docs/PROJECT.md) | 做什么、不做什么、验收标准 |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 数据流、模型、树算法和 Adapter 边界 |
-| [docs/DECISIONS.md](docs/DECISIONS.md) | 已确定的技术决定及原因 |
-| [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md) | 当前实现、接口分页、JSON 与错误语义 |
+| [docs/project.markdown](docs/project.markdown) | 项目为什么存在、长期意图与常青原则 |
+| [docs/architecture.markdown](docs/architecture.markdown) | 当前实现结构、数据流、模型、树算法和 Adapter 边界 |
+| [docs/roadmap.markdown](docs/roadmap.markdown) | 未来方向与依赖顺序（计划，不是已实现事实） |
 | [docs/REFERENCE_RESEARCH.md](docs/REFERENCE_RESEARCH.md) | 三个参考项目的代码级调研与取舍 |
+
+`docs/comet/` 由 Comet 管理具体 change 的 brief/spec/state/verification/archive 与功能生命周期；当前没有 active change，其与三份长期文档的分工见 [docs/project.markdown](docs/project.markdown)。
 
 ## 路线图
 
-1. **MVP1：完整评论树读取（当前）**
-   - 只读抓取、规范化、建树、对话链、完整性和诊断。
-2. **SQLite 增量去重**
-   - 以 `comment_id` 为唯一键持久化并增量读取。
-3. **AI 决策与生成**
-   - 消费评论树和对话链，生成待审核草稿。
-4. **人工审核**
-   - 确认、修改或拒绝 AI 草稿。
-5. **自动回复**
-   - 仅发送审核通过的内容，并继续通过 Adapter 隔离写接口。
+**MVP1（完整评论树读取）已完成。** 后续依赖顺序为 SQLite 增量去重 → AI 决策与生成 → 人工审核 → 自动回复；以上均未实现，当前没有 active Comet change。依赖顺序、验收方向与开放问题见 [docs/roadmap.markdown](docs/roadmap.markdown)，该文档是唯一权威路线图。
 
 ## 参考项目（参考不等于复制）
 
