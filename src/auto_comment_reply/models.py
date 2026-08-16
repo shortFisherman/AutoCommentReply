@@ -62,6 +62,63 @@ class VideoInfo:
         }
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class Viewer:
+    """Credential-free snapshot of the current local session's viewer identity.
+
+    ``platform_user_id`` is the stable identity (Bilibili mid). ``username`` is
+    display-only and must never participate in identity comparisons. This object
+    never holds cookies or any other authentication material.
+    """
+
+    platform: str
+    authenticated: bool
+    platform_user_id: int | None
+    username: str | None
+
+    @property
+    def identity(self) -> tuple[str, bool, int | None]:
+        """Stable identity fields; ``username`` is display-only and excluded."""
+        return (self.platform, self.authenticated, self.platform_user_id)
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Viewer):
+            return NotImplemented
+        return self.identity == other.identity
+
+    def __hash__(self) -> int:
+        return hash(self.identity)
+
+    def __post_init__(self) -> None:
+        if self.authenticated:
+            if (
+                isinstance(self.platform_user_id, bool)
+                or not isinstance(self.platform_user_id, int)
+                or self.platform_user_id <= 0
+            ):
+                raise ValueError("authenticated viewer 必须有正整数 platform_user_id")
+            if self.username is not None and not isinstance(self.username, str):
+                raise ValueError("authenticated viewer 的 username 必须是字符串或 null")
+        elif self.platform_user_id is not None or self.username is not None:
+            raise ValueError("anonymous viewer 不能携带平台身份字段")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "platform": self.platform,
+            "authenticated": self.authenticated,
+            "platform_user_id": self.platform_user_id,
+            "username": self.username,
+        }
+
+
+ANONYMOUS_VIEWER = Viewer(
+    platform="bilibili",
+    authenticated=False,
+    platform_user_id=None,
+    username=None,
+)
+
+
 @dataclass(frozen=True, slots=True)
 class Diagnostic:
     severity: Literal["info", "warning", "error"]
@@ -114,3 +171,4 @@ class FetchResult:
     diagnostics: list[Diagnostic]
     stats: FetchStats
     discussion: DiscussionReference | None = None
+    viewer: Viewer = ANONYMOUS_VIEWER

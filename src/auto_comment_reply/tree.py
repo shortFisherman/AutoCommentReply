@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -18,9 +19,14 @@ class CommentNode:
     comment: Comment
     children: list[CommentNode] = field(default_factory=list)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(
+        self,
+        *,
+        comment_serializer: Callable[[Comment], dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        serialize = comment_serializer or Comment.to_dict
         root_document: dict[str, Any] = {
-            "comment": self.comment.to_dict(),
+            "comment": serialize(self.comment),
             "children": [],
         }
         stack: list[tuple[CommentNode, dict[str, Any]]] = [(self, root_document)]
@@ -30,7 +36,7 @@ class CommentNode:
             document["children"] = child_documents
             for child in node.children:
                 child_document: dict[str, Any] = {
-                    "comment": child.comment.to_dict(),
+                    "comment": serialize(child.comment),
                     "children": [],
                 }
                 child_documents.append(child_document)

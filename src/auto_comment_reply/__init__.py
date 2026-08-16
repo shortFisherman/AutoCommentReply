@@ -1,7 +1,15 @@
 """Read-only Bilibili comment tree extraction."""
 
 from .adapter import BilibiliAdapter
-from .models import Comment, Diagnostic, FetchResult, FetchStats, VideoInfo
+from .models import (
+    ANONYMOUS_VIEWER,
+    Comment,
+    Diagnostic,
+    FetchResult,
+    FetchStats,
+    VideoInfo,
+    Viewer,
+)
 from .reference import (
     CommentReference,
     DiscussionReference,
@@ -11,6 +19,7 @@ from .reference import (
 from .tree import CommentGraphError, TreeBuildResult, build_comment_forest, trace_to_root
 
 __all__ = [
+    "ANONYMOUS_VIEWER",
     "BilibiliAdapter",
     "Comment",
     "CommentGraphError",
@@ -21,6 +30,7 @@ __all__ = [
     "FetchStats",
     "TreeBuildResult",
     "VideoInfo",
+    "Viewer",
     "build_discussion_reference",
     "build_comment_forest",
     "parse_comment_reference",

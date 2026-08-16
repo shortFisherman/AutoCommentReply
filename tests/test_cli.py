@@ -1,11 +1,25 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 
+import httpx
 import pytest
+from _helpers import (
+    UNIQUE_SECRET,
+    VIEWER_MID,
+    api_response,
+    discussion_reply_payload,
+    login_nav_data,
+    make_client,
+    raw_comment,
+    share_url,
+    view_data,
+)
 
 from auto_comment_reply import cli
+from auto_comment_reply.adapter import BilibiliAdapter
 from auto_comment_reply.errors import ParameterError
 from auto_comment_reply.models import Comment, Diagnostic, FetchResult, FetchStats, VideoInfo
 from auto_comment_reply.reference import DiscussionReference
@@ -76,6 +90,24 @@ def fake_adapter_class(result: FetchResult | Exception, captured: dict[str, obje
             return result
 
     return FakeAdapter
+
+
+def real_adapter_factory(
+    handler: Callable[[httpx.Request], httpx.Response],
+) -> Callable[..., BilibiliAdapter]:
+    """Build a real adapter on MockTransport for end-to-end offline CLI tests."""
+
+    def factory(**kwargs: object) -> BilibiliAdapter:
+        return BilibiliAdapter(
+            **{
+                **kwargs,
+                "client": make_client(handler),
+                "request_delay": 0,
+                "retries": 0,
+            }
+        )
+
+    return factory
 
 
 def test_cli_complete_result_prints_json_and_returns_zero(
@@ -209,3 +241,217 @@ def test_cli_existing_output_returns_one_before_fetch(
     assert exit_code == 1
     assert captured == {}
     assert "输出文件已存在" in caplog.text
+
+
+def test_cli_authenticated_cookie_file_run_writes_schema_1_2_without_secret(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    secret = UNIQUE_SECRET
+    cookie_file = tmp_path / "private.cookie"
+    cookie_file.write_text(secret, encoding="utf-8-sig")
+    output = tmp_path / "out.json"
+    request_paths: list[str] = []
+    cookie_headers: list[str | None] = []
+    env_decoy = "SESSDATA=env-decoy-secret-5f1a2b3c"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_paths.append(request.url.path)
+        cookie_headers.append(request.headers.get("Cookie"))
+        assert secret not in str(request.url)
+        if request.url.path == "/x/web-interface/nav":
+            assert request.headers.get("Cookie") == secret
+            return api_response(request, login_nav_data())
+        if request.url.path == "/x/web-interface/view":
+            return api_response(request, view_data())
+        if request.url.path == "/x/v2/reply/reply":
+            return api_response(
+                request,
+                discussion_reply_payload(
+                    raw_comment(100, mid=VIEWER_MID),
+                    replies=[raw_comment(110, root=100, parent=100, mid=999)],
+                ),
+            )
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    monkeypatch.setattr(cli, "BilibiliAdapter", real_adapter_factory(handler))
+    monkeypatch.setenv("BILIBILI_COOKIE", env_decoy)
+
+    exit_code = cli.main(
+        [
+            share_url(100),
+            "--cookie-file",
+            str(cookie_file),
+            "-o",
+            str(output),
+            "--force",
+            "--verbose",
+        ]
+    )
+
+    streams = capsys.readouterr()
+    document = json.loads(output.read_text(encoding="utf-8"))
+    assert exit_code == 0
+    assert document["schema_version"] == "1.2"
+    assert document["viewer"]["authenticated"] is True
+    assert document["viewer"]["platform_user_id"] == VIEWER_MID
+    assert request_paths.count("/x/web-interface/nav") == 1
+    assert all(header == secret for header in cookie_headers)
+    for text in (
+        output.read_text(encoding="utf-8"),
+        streams.out,
+        streams.err,
+    ):
+        assert secret not in text
+        assert env_decoy not in text
+
+
+def test_cli_auth_failure_exits_1_without_json_on_stdout_or_disk(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    secret = UNIQUE_SECRET
+    cookie_file = tmp_path / "private.cookie"
+    cookie_file.write_text(secret, encoding="utf-8-sig")
+    output = tmp_path / "out.json"
+    reply_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/x/web-interface/nav":
+            return api_response(request, login_nav_data(is_login=False))
+        if request.url.path == "/x/web-interface/view":
+            return api_response(request, view_data())
+        if request.url.path == "/x/v2/reply/reply":
+            nonlocal reply_calls
+            reply_calls += 1
+            raise AssertionError("评论读取不得在认证失败后开始")
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    monkeypatch.setattr(cli, "BilibiliAdapter", real_adapter_factory(handler))
+
+    exit_code = cli.main(
+        [
+            share_url(100),
+            "--cookie-file",
+            str(cookie_file),
+            "-o",
+            str(output),
+            "--verbose",
+        ]
+    )
+    streams = capsys.readouterr()
+
+    assert exit_code == 1
+    assert reply_calls == 0
+    assert streams.out == ""
+    assert not output.exists()
+    assert secret not in streams.out
+    assert secret not in streams.err
+
+    stdout_exit_code = cli.main([share_url(100), "--cookie-file", str(cookie_file), "--verbose"])
+    stdout_streams = capsys.readouterr()
+    assert stdout_exit_code == 1
+    assert stdout_streams.out == ""
+    assert secret not in stdout_streams.out
+    assert secret not in stdout_streams.err
+
+
+def test_cli_env_cookie_is_used_when_no_cookie_file(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    secret = UNIQUE_SECRET
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/x/web-interface/nav":
+            assert request.headers.get("Cookie") == secret
+            return api_response(request, login_nav_data())
+        if request.url.path == "/x/web-interface/view":
+            return api_response(request, view_data())
+        if request.url.path == "/x/v2/reply/reply":
+            return api_response(
+                request,
+                discussion_reply_payload(raw_comment(100, mid=VIEWER_MID)),
+            )
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    monkeypatch.setattr(cli, "BilibiliAdapter", real_adapter_factory(handler))
+    monkeypatch.setenv("BILIBILI_COOKIE", secret)
+
+    exit_code = cli.main([share_url(100), "--compact", "--quiet"])
+
+    streams = capsys.readouterr()
+    document = json.loads(streams.out)
+    assert exit_code == 0
+    assert document["viewer"]["authenticated"] is True
+    assert document["viewer"]["platform_user_id"] == VIEWER_MID
+    assert secret not in streams.out
+    assert secret not in streams.err
+
+
+def test_cli_anonymous_run_emits_anonymous_viewer_without_nav(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    request_paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_paths.append(request.url.path)
+        if request.url.path == "/x/web-interface/view":
+            return api_response(request, view_data())
+        if request.url.path == "/x/v2/reply/reply":
+            return api_response(
+                request,
+                discussion_reply_payload(raw_comment(100)),
+            )
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    monkeypatch.setattr(cli, "BilibiliAdapter", real_adapter_factory(handler))
+    monkeypatch.delenv("BILIBILI_COOKIE", raising=False)
+
+    exit_code = cli.main([share_url(100), "--compact", "--quiet"])
+
+    document = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert document["viewer"] == {
+        "platform": "bilibili",
+        "authenticated": False,
+        "platform_user_id": None,
+        "username": None,
+    }
+    assert "/x/web-interface/nav" not in request_paths
+
+
+def test_cli_empty_cookie_file_exits_1_before_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    cookie_file = tmp_path / "empty.cookie"
+    cookie_file.write_text("", encoding="utf-8")
+    output = tmp_path / "out.json"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    monkeypatch.setattr(cli, "BilibiliAdapter", real_adapter_factory(handler))
+
+    exit_code = cli.main(
+        [
+            "BV1xx411c7mD",
+            "--cookie-file",
+            str(cookie_file),
+            "-o",
+            str(output),
+            "--verbose",
+        ]
+    )
+
+    streams = capsys.readouterr()
+    assert exit_code == 1
+    assert streams.out == ""
+    assert not output.exists()
+    assert "Cookie 文件为空" in caplog.text

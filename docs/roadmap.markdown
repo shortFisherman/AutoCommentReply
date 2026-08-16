@@ -1,12 +1,13 @@
 # 路线图：从 legacy 基线到上下文与回复助手
 
-> 本文档描述 M2+ 的**计划**，不构成实施授权；M1 的完成状态与验证记录见下文。当前实现架构见 [architecture.markdown](architecture.markdown)（当前项目画像），项目意图见 [project.markdown](project.markdown)，当前可运行代码的完整现状见 architecture。
+> 本文档描述 M3+ 的**计划**，不构成实施授权；M1/M2 的完成状态与验证记录见下文。当前实现架构见 [architecture.markdown](architecture.markdown)（当前项目画像），项目意图见 [project.markdown](project.markdown)，当前可运行代码的完整现状见 architecture。
 
 ## 状态
 
-- **M1（输入与讨论定向读取）：已完成**——这是当前 MVP；legacy 整视频只读（旧 MVP）保留为诊断兼容，不是目标产品。
-- M2–M7 均**未实现**，当前没有 active Comet change。
-- 任何后续编码必须先有明确的用户授权或 Comet change，再开始实施；roadmap 本身不授权提前编码，也不允许跨阶段偷跑。
+- **M1（输入与讨论定向读取）：已完成**——讨论定向读取是当前 MVP 的基础；legacy 整视频只读（旧 MVP）保留为诊断兼容，不是目标产品。
+- **M2（本地认证与 viewer 身份）：已完成**——正式需求、规格与验收历史由 Comet change `local-auth-viewer-identity` 承载；验证记录见下文。
+- M3–M7 均**未实现**。
+- 任何后续编码必须先有明确的用户授权或新的 Comet change，再开始实施；roadmap 本身不授权提前编码，也不允许跨阶段偷跑。
 
 ## 迁移总原则
 
@@ -26,24 +27,39 @@
   - 同一输入两次运行得到同一讨论身份 `(bilibili, video, oid, root_comment_id)`，且与 focus/viewer 无关——已验证（离线测试）。
   - `focus_comment_id` 不作为 parent/root 使用、不改变同步范围——已验证（离线测试）。
   - b23 链最多 5 跳，循环/畸形/非 http(s)/userinfo/危险端口/外站目标被拒绝，第一个非 b23 目标必须是允许的 Bilibili 域名，终态 HTML 不请求——已验证（离线测试）。
-  - 定向读取请求量只与楼中楼页数相关，不出现主评论翻页（`root_pages_fetched=0`），不调用 nav/WBI/main——已验证（离线测试 + 真实 smoke）。
+  - 定向读取请求量只与楼中楼页数相关，不出现主评论翻页（`root_pages_fetched=0`），不调用 nav/WBI/main（M1 验收时；M2 起认证定向新增一次可与 legacy WBI 共用的 nav 身份请求）——已验证（离线测试 + 真实 smoke）。
   - 缺 `comment_root_id` 或 focus 冲突 fail closed，不退回全量；根无效时 `complete=false` 且不声称永久删除——已验证（离线测试）。
-  - 输出 schema 1.1；`complete/diagnostics/exit 0/1/2` 语义与 legacy 一致——已验证。
-  - 验证基线：`129 passed`、覆盖率 89%；匿名真实 CLI smoke：1 根评论 + 1 回复、`root_pages_fetched=0`、`complete=true`。
+  - 输出 schema 1.1（M1 验收时为 1.1；M2 已按用户确认将定向输出升级为 schema 1.2）；`complete/diagnostics/exit 0/1/2` 语义与 legacy 一致——已验证。
+  - M1 验收基线（当时）：`129 passed`、覆盖率 89%；匿名真实 CLI smoke：1 根评论 + 1 回复、`root_pages_fetched=0`、`complete=true`。
 - **非范围**：SQLite、认证身份、通知、LLM、写接口。
 
-### M2 本地认证与 viewer 身份（planned）
+### M2 本地认证与 viewer 身份（已完成）
 
 - **目标**：本地 authenticated session + 当前 viewer 身份（`platform_user_id` / B 站 mid），而不是只有 Cookie 文本；用户名仅展示；凭证不暴露给模型、不写进日志。
-- **前置依赖**：M1（输入与定向读取链路）。
-- **最低验收（安全门）**：匿名/登录两种 viewer 可区分；`is_self` 在输出时按 `author_id == viewer.platform_user_id` 派生；匿名为 unknown/null，不默认为 false；凭证不出现在模型上下文与日志。
+- **实现要点**：
+  - 认证输入沿用 `--cookie-file`（本机私有文件，优先）与 `BILIBILI_COOKIE` 环境变量；无 `auth.json`、`--auth-file`、默认凭证路径或跨运行认证状态；凭证只存在于进程内与发往允许 Bilibili 主机的 Cookie header；操作者只向 Agent/模型提供凭证文件路径与任务输入，不提供 Cookie 内容。
+  - 无凭证 → 显式 anonymous viewer（`authenticated=false`、`platform_user_id=null`、`username=null`），不因身份请求 nav；有凭证 → 评论读取前一次 `GET /x/web-interface/nav` 解析 `isLogin=true` + 正整数 mid（uname 仅展示、可空），在同一 Adapter 生命周期内缓存并与 legacy WBI 取 key 共用。
+  - 身份无法确认（nav 未登录 / mid 非法 / 结构无效 / 请求失败）→ fail closed，CLI exit 1 且 stdout/磁盘均无 JSON，不静默降级为匿名。
+  - 定向输出升级 schema 1.2：顶层 `viewer`；`comments`/`trees` 只输出 `author_id` + 三态 `is_self`，不保留 `user_id` 兼容别名；`is_self` 输出期派生，不入 Comment 事实模型。legacy schema 1.0 不变。
+  - 讨论 identity `(platform, object_type, oid, root_comment_id)`、focus 规则、同步范围与 `root_pages_fetched=0` 不随 viewer 变化；定向路径仍不调用主评论 `main`、不做 WBI 签名。
+- **前置依赖**：M1（输入与定向读取链路，已完成）。
+- **最低验收（安全门，已逐项验证）**：
+  - A1 匿名显式 viewer 且不为身份请求 nav——已验证（离线测试：定向路径无 nav 请求）。
+  - A2 登录 viewer 经一次 nav 解析并缓存，与 legacy WBI 共用同一响应；同一 Adapter 生命周期内多次读取 nav 计数为 1——已验证（离线测试）。
+  - A3 `is_self` 三态：作者=viewer → `true`、作者已知且不等 → `false`、viewer 匿名或作者未知 → `null`；不存入 Comment 事实模型——已验证（离线测试）。
+  - A4 提供凭证但 nav 未登录/`isLogin` 缺失/`mid` 缺失或非法/结构无效 → 类型化认证/解析错误，CLI exit 1、无 JSON，评论读取不开始——已验证（离线参数化测试，12 种非法形态）。
+  - A5 同一评论链接在匿名与任意登录 viewer 下 discussion identity 与同步范围一致；定向路径不调用 `main`、不做 WBI 签名，`root_pages_fetched=0`——已验证（离线测试）。
+  - A6 唯一标记测试凭证不出现在 JSON、文件、stderr/verbose、异常、repr、diagnostics/details 或文档——已验证（离线泄漏路径断言）。
+  - A7 legacy schema 1.0 输出契约与 fail-closed、complete、diagnostics、exit 0/1/2 语义不回归——已验证（离线测试）。
+  - A8 验证基线：`uv run ruff format --check .` 与 `uv run ruff check .` 通过；`uv run pytest --cov=auto_comment_reply` 为 **168 passed**、总覆盖率 **90%**。
+  - 真实只读核验：2026-08-16 匿名 nav 返回 `code=-101`、`isLogin=false`、`mid=null`、`uname=null`，且仍含可用的 `wbi_img`；登录态**只**由脱敏离线 fixture 验证（`tests/_helpers.py`、`test_viewer.py`、`test_output.py`、`test_cli.py`），未使用真实私人账号 smoke，不伪称已做真实登录验证。
 - **非范围**：通知读取、SQLite 全量迁移、写接口。
 
 ### M3 SQLite 持久化与同步语义（planned）
 
 - **目标**：只持久化用户选中的讨论；实体至少含 viewer（`platform_user_id`）、discussions（身份与 viewer 无关）、comments（关系、作者、内容；唯一约束 `(discussion_id, platform_comment_id)`，不含 `is_self`/单一 visibility；comment/display 字段与平台线协议字段隔离）、discussion_viewer_state（`(discussion_id, viewer_id)`、绑定/追踪状态、`last_complete` baseline）、comment_observation（`(discussion_id, viewer_id, comment_id)`、first_seen/last_seen/current visibility 仅 `visible / not_currently_visible`）、sync_runs（viewer + discussion、observed_ids、complete、diagnostics）、notification_sync_state、reply_events（含独立 `target_availability`：unknown / available / unavailable，与事件状态正交）、outbound_replies/outbox。
 - 同步语义：每次 sync_run 记录 `observed_ids`；对 `(viewer_id, discussion_id)` 持久化 `ever_seen_ids` 与 `last_complete_visible_ids`；开始本轮前 `previous_visible_ids = last_complete_visible_ids`；无论 complete 与否，`newly_observed = observed_ids − ever_seen_before` 后并入 ever_seen；`complete=true` 时 `current_visible_ids = observed_ids`、`not_currently_visible = previous − current` 并更新 baseline，可见性只写 `visible / not_currently_visible`、差集只能推进 `not_currently_visible` 且不证明删除；`complete=false` 时**不替换 baseline、不计算缺失/删除/当前不可见差集**，只保留新观察与诊断；`unavailable` 不是 `current_visibility` 的值，而是 `reply_event.target_availability` 的值，不证明永久删除。
-- **前置依赖**：M2（viewer 身份）。
+- **前置依赖**：M2（viewer 身份，已完成）。
 - **最低验收（安全门）**：事务与唯一约束生效；崩溃后可恢复；同 viewer 完整同步产生正确的可见性 diff（含 baseline 更新）；不完整同步不产生删除/当前不可见推断、不替换 baseline；`comment_observation.current_visibility` 不出现 `unavailable`，`reply_event.target_availability` 与事件状态独立存储；跨小时多讨论可查询；旧 `comments.json` 不作为产品数据迁移（仅诊断用）。
 - **非范围**：通知发现、LLM、写接口。
 

@@ -722,7 +722,8 @@ def test_fetch_reference_expanded_comment_link_targets_one_root_without_main_or_
     assert [item.comment_id for item in result.comments] == [100]
     assert result.discussion is not None
     assert result.discussion.identity == ("bilibili", "video", 42, 100)
-    assert document["schema_version"] == "1.1"
+    assert document["schema_version"] == "1.2"
+    assert document["viewer"]["authenticated"] is False
     assert document["discussion"]["oid"] == 42
     assert document["discussion"]["focus_comment_id"] is None
     assert document["stats"]["root_pages_fetched"] == 0

@@ -25,7 +25,15 @@ from .errors import (
     RateLimitError,
     ResponseParseError,
 )
-from .models import Comment, Diagnostic, FetchResult, FetchStats, VideoInfo
+from .models import (
+    ANONYMOUS_VIEWER,
+    Comment,
+    Diagnostic,
+    FetchResult,
+    FetchStats,
+    VideoInfo,
+    Viewer,
+)
 from .reference import (
     DiscussionReference,
     build_discussion_reference,
@@ -44,6 +52,7 @@ CHILD_REPLY_ENDPOINT = f"{API_BASE}/x/v2/reply/reply"
 
 _BVID_RE = re.compile(r"BV[0-9A-Za-z]{10}")
 _AID_RE = re.compile(r"(?:^|/)(?:av)?(?P<aid>[1-9][0-9]*)(?:$|[/?#])", re.IGNORECASE)
+_DECIMAL_INT_RE = re.compile(r"[0-9]+")
 _ALLOWED_BILIBILI_HOSTS = {"bilibili.com", "www.bilibili.com", "m.bilibili.com", "b23.tv"}
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _MAX_SHORT_LINK_HOPS = 5
@@ -83,6 +92,7 @@ class BilibiliAdapter:
         if cookie and ("\r" in cookie or "\n" in cookie):
             raise ValueError("Cookie 不能包含换行符")
 
+        credential = cookie.strip() if cookie else None
         headers = {
             "Accept": "application/json, text/plain, */*",
             "Referer": "https://www.bilibili.com/",
@@ -92,8 +102,8 @@ class BilibiliAdapter:
                 "Chrome/131.0.0.0 Safari/537.36"
             ),
         }
-        if cookie:
-            headers["Cookie"] = cookie.strip()
+        if credential:
+            headers["Cookie"] = credential
 
         self._owns_client = client is None
         self._client = client or httpx.Client(headers=headers, timeout=timeout)
@@ -111,6 +121,9 @@ class BilibiliAdapter:
         self._last_request_at: float | None = None
         self._mixin_key: str | None = None
         self._mixin_key_loaded_at: float | None = None
+        self._authenticated_session = credential is not None
+        self._viewer: Viewer | None = None
+        self._nav_payload: Mapping[str, Any] | None = None
 
     def __enter__(self) -> BilibiliAdapter:
         return self
@@ -125,6 +138,7 @@ class BilibiliAdapter:
     def fetch(self, video_reference: str) -> FetchResult:
         """Read every currently visible root and child reply for one video."""
 
+        viewer = self._resolve_viewer()
         video = self.resolve_video(video_reference)
         stats = FetchStats()
         diagnostics: list[Diagnostic] = []
@@ -189,6 +203,7 @@ class BilibiliAdapter:
             complete=complete,
             diagnostics=diagnostics,
             stats=stats,
+            viewer=viewer,
         )
 
     def fetch_reference(self, reference: str) -> FetchResult:
@@ -233,6 +248,7 @@ class BilibiliAdapter:
             raise ParameterError("只接受 Bilibili 评论链接或 b23.tv 短链。")
 
         comment_reference = parse_comment_reference(candidate)
+        viewer = self._resolve_viewer()
         video = self.resolve_video(candidate)
         discussion = build_discussion_reference(video, comment_reference)
 
@@ -260,6 +276,7 @@ class BilibiliAdapter:
                 comments={},
                 diagnostics=diagnostics,
                 stats=stats,
+                viewer=viewer,
             )
 
         if not isinstance(data, Mapping):
@@ -277,6 +294,7 @@ class BilibiliAdapter:
                 comments={},
                 diagnostics=diagnostics,
                 stats=stats,
+                viewer=viewer,
             )
 
         stats.reply_pages_fetched += 1
@@ -390,6 +408,7 @@ class BilibiliAdapter:
                 comments=comments,
                 diagnostics=diagnostics,
                 stats=stats,
+                viewer=viewer,
             )
 
         raw_replies = data.get("replies") or []
@@ -408,6 +427,7 @@ class BilibiliAdapter:
                 comments=comments,
                 diagnostics=diagnostics,
                 stats=stats,
+                viewer=viewer,
             )
 
         parsed_page_replies: list[Comment] = []
@@ -458,6 +478,7 @@ class BilibiliAdapter:
                 comments=comments,
                 diagnostics=diagnostics,
                 stats=stats,
+                viewer=viewer,
             )
 
         seen_api_ids = {reply.comment_id for reply in kept_replies}
@@ -489,6 +510,7 @@ class BilibiliAdapter:
                 comments=comments,
                 diagnostics=diagnostics,
                 stats=stats,
+                viewer=viewer,
             )
 
         if expected_reply_count is None or len(seen_api_ids) < expected_reply_count:
@@ -517,6 +539,7 @@ class BilibiliAdapter:
             comments=comments,
             diagnostics=diagnostics,
             stats=stats,
+            viewer=viewer,
         )
 
     def resolve_video(self, video_reference: str) -> VideoInfo:
@@ -624,6 +647,7 @@ class BilibiliAdapter:
         comments: dict[int, Comment],
         diagnostics: list[Diagnostic],
         stats: FetchStats,
+        viewer: Viewer,
     ) -> FetchResult:
         normalized = list(comments.values())
         stats.root_comments_fetched = sum(item.is_root for item in normalized)
@@ -638,6 +662,7 @@ class BilibiliAdapter:
             diagnostics=diagnostics,
             stats=stats,
             discussion=discussion,
+            viewer=viewer,
         )
 
     def _resolve_short_link(self, initial_url: str) -> str:
@@ -1181,10 +1206,15 @@ class BilibiliAdapter:
         ):
             return self._mixin_key
 
-        # Anonymous nav responses use code=-101 while still returning usable wbi_img data.
-        data = self._request_api(NAV_ENDPOINT, scope="wbi_key", allowed_api_codes={-101})
-        if not isinstance(data, Mapping):
-            raise ResponseParseError("nav 接口缺少 data 对象，无法生成 WBI 签名。")
+        if force_refresh or self._nav_payload is None:
+            # Anonymous nav responses use code=-101 while still returning usable wbi_img data.
+            data = self._request_api(NAV_ENDPOINT, scope="wbi_key", allowed_api_codes={-101})
+            if not isinstance(data, Mapping):
+                raise ResponseParseError("nav 接口缺少 data 对象，无法生成 WBI 签名。")
+            self._nav_payload = data
+        else:
+            data = self._nav_payload
+
         wbi_img = data.get("wbi_img")
         if not isinstance(wbi_img, Mapping):
             raise ResponseParseError("nav 响应缺少 wbi_img，无法生成 WBI 签名。")
@@ -1198,6 +1228,68 @@ class BilibiliAdapter:
             raise ResponseParseError(str(error)) from error
         self._mixin_key_loaded_at = now
         return self._mixin_key
+
+    def _resolve_viewer(self) -> Viewer:
+        """Resolve the session viewer once, sharing one cached nav response.
+
+        An anonymous session never requests nav for identity. An authenticated
+        session fails closed when nav cannot confirm ``isLogin=true`` plus a
+        positive integer mid.
+        """
+
+        if self._viewer is not None:
+            return self._viewer
+        if not self._authenticated_session:
+            self._viewer = ANONYMOUS_VIEWER
+            return self._viewer
+
+        data = self._nav_payload
+        if data is None:
+            try:
+                data = self._request_api(NAV_ENDPOINT, scope="viewer_identity")
+            except AuthenticationError as error:
+                raise AuthenticationError(
+                    "Bilibili 登录态无效或已过期，无法确认当前 viewer。"
+                ) from error
+            except ResponseParseError as error:
+                raise ResponseParseError(
+                    "Bilibili nav 响应结构无效，无法确认当前 viewer。"
+                ) from error
+            except BilibiliError as error:
+                raise AuthenticationError("Bilibili 身份确认失败，无法确认当前 viewer。") from error
+            if not isinstance(data, Mapping):
+                raise ResponseParseError("Bilibili nav 响应结构无效，无法确认当前 viewer。")
+            self._nav_payload = data
+
+        self._viewer = self._parse_viewer(data)
+        return self._viewer
+
+    def _parse_viewer(self, data: Any) -> Viewer:
+        """Parse a credential-free viewer from a nav response, failing closed."""
+
+        if not isinstance(data, Mapping):
+            raise ResponseParseError("Bilibili nav 响应结构无效，无法确认当前 viewer。")
+        if data.get("isLogin") is not True:
+            raise AuthenticationError("Bilibili 登录态无效或已过期，无法确认当前 viewer。")
+        try:
+            mid = self._strict_positive_int(data.get("mid"), field="mid")
+        except (TypeError, ValueError) as error:
+            raise ResponseParseError("Bilibili nav 响应缺少有效的登录用户 mid。") from error
+
+        raw_username = data.get("uname")
+        if raw_username is None:
+            username = None
+        elif isinstance(raw_username, str):
+            username = raw_username
+        else:
+            raise ResponseParseError("Bilibili nav 响应中的 uname 字段无效。")
+
+        return Viewer(
+            platform="bilibili",
+            authenticated=True,
+            platform_user_id=mid,
+            username=username,
+        )
 
     def _request_api(
         self,
@@ -1220,30 +1312,29 @@ class BilibiliAdapter:
             raise ResponseParseError("Bilibili API 响应不是 JSON 对象。")
 
         code = self._optional_int(payload.get("code"))
-        message = payload.get("message") or payload.get("msg") or "未知错误"
         if code == 0 or (allowed_api_codes is not None and code in allowed_api_codes):
             return payload.get("data")
         if code == -101:
             raise AuthenticationError("Bilibili 登录态无效或已过期。", api_code=code)
         if code in {-352, -403, -412}:
             raise AccessDeniedError(
-                f"Bilibili 拒绝访问：{message}", api_code=code, details={"scope": scope}
+                "Bilibili 拒绝访问当前接口。", api_code=code, details={"scope": scope}
             )
         if code in {-799, -509}:
             raise RateLimitError(
-                f"Bilibili 请求频率受限（code={code}）：{message}",
+                f"Bilibili 请求频率受限（code={code}）。",
                 api_code=code,
                 retryable=True,
                 details={"scope": scope},
             )
         if code == -400:
-            raise ParameterError(f"Bilibili 接口参数错误：{message}", api_code=code)
+            raise ParameterError("Bilibili 接口参数错误。", api_code=code)
         if code in {-404, 100100404}:
-            raise BusinessError(f"视频或评论不存在：{message}", api_code=code)
+            raise BusinessError("视频或评论不存在。", api_code=code)
         if code == 12002:
             raise BusinessError("该视频评论区已关闭。", api_code=code)
         raise BusinessError(
-            f"Bilibili 业务错误（code={code}）：{message}",
+            f"Bilibili 业务错误（code={code}）。",
             api_code=code,
             details={"scope": scope},
         )
@@ -1326,6 +1417,20 @@ class BilibiliAdapter:
         except (TypeError, ValueError) as error:
             raise TypeError(field) from error
         if result < 0:
+            raise ValueError(field)
+        return result
+
+    @staticmethod
+    def _strict_positive_int(value: Any, *, field: str) -> int:
+        if isinstance(value, (bool, float)):
+            raise TypeError(field)
+        if isinstance(value, int):
+            result = value
+        elif isinstance(value, str) and _DECIMAL_INT_RE.fullmatch(value):
+            result = int(value)
+        else:
+            raise TypeError(field)
+        if result <= 0:
             raise ValueError(field)
         return result
 
