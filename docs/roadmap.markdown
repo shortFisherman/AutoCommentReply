@@ -1,64 +1,102 @@
-# 路线图：以后往哪走
+# 路线图：从 legacy 基线到上下文与回复助手
 
-> 本文档只描述**计划**，不是已实现事实，也不构成实施授权。当前实现见 [architecture.markdown](architecture.markdown)，项目意图见 [project.markdown](project.markdown)。
+> 本文档描述 M2+ 的**计划**，不构成实施授权；M1 的完成状态与验证记录见下文。当前实现架构见 [architecture.markdown](architecture.markdown)（当前项目画像），项目意图见 [project.markdown](project.markdown)，当前可运行代码的完整现状见 architecture。
 
 ## 状态
 
-- **MVP1（完整评论树读取）：已完成。**
-- 下列里程碑均**未实现**，且当前没有 active Comet change。
-- 任何后续工作必须先有明确的用户授权或 Comet change，再开始编码；roadmap 本身不授权提前编码。
+- **M1（输入与讨论定向读取）：已完成**——这是当前 MVP；legacy 整视频只读（旧 MVP）保留为诊断兼容，不是目标产品。
+- M2–M7 均**未实现**，当前没有 active Comet change。
+- 任何后续编码必须先有明确的用户授权或 Comet change，再开始实施；roadmap 本身不授权提前编码，也不允许跨阶段偷跑。
 
-## MVP1 完成证据
+## 迁移总原则
 
-- 已有可运行的实现与离线测试（`httpx.MockTransport`，不依赖真实网络）。
-- 项目所有者做过真实只读运行，并人工检查了根目录本地 `comments.json` 输出。
-- 私有运行证据（视频、评论内容、用户名、数量、Cookie 等）不进入文档，也不作为稳定 fixture。
+- 每个里程碑独立可验收；最低验收即安全门。
+- 目标能力不得在迁移前写进当前代码；legacy 全量抓取 CLI 可继续用于诊断，直到 M7 做出退役/保留的明确决定。
+- B 站私有接口细节以捕获或最小授权实测为准；本路线图不预设未经证实的接口契约。
 
-## 依赖顺序
+## 依赖顺序与里程碑
 
-### 1. SQLite 增量去重
+### M1 输入与讨论定向读取（已完成）
 
-- **目标**：以 `comment_id` 为唯一键持久化评论，支持按 `created_at` 增量读取，避免重复抓取与重复处理。
-- **前置依赖**：MVP1 的模型与输出稳定；需要决定存储 schema 与增量游标语义。
-- **最低验收方向/安全门**：重复运行不产生重复记录；增量读取能接上上次位置；schema 可迁移；完整性与诊断信息仍保留。
-- **不在上一阶段偷跑**：MVP1 保持无数据库的纯读取 CLI；此阶段也不引入 AI。
+- **目标**：支持手机分享链接（b23.tv 或展开后的 URL）作为入口；解析 `comment_root_id`、`comment_secondary_id`、`#reply<id>`；忽略 `share_tag / unique_k / vd_source` 等追踪参数；规范化 `(platform, object_type, oid/aid, bvid, root_comment_id, focus_comment_id)`。
+- b23 解析：跟随 30x 的 `Location` 最多 5 跳，每一跳先验证（拒绝循环、畸形、非 http(s)）；链上第一个非 b23 目标必须是允许的 Bilibili 域名，外站立即拒绝，防止任意 URL/SSRF 入口；拿到允许的非 b23 `Location` 后直接解析 query/fragment，尽量不请求最终视频页面。
+- 定向同步：只抓指定根评论及其当前所有可见楼中楼回复；不再翻整段视频根评论列表。
+- **前置依赖**：现有 Adapter 的解析/建树能力（保留复用）。
+- **最低验收（安全门，已逐项验证）**：
+  - 同一输入两次运行得到同一讨论身份 `(bilibili, video, oid, root_comment_id)`，且与 focus/viewer 无关——已验证（离线测试）。
+  - `focus_comment_id` 不作为 parent/root 使用、不改变同步范围——已验证（离线测试）。
+  - b23 链最多 5 跳，循环/畸形/非 http(s)/userinfo/危险端口/外站目标被拒绝，第一个非 b23 目标必须是允许的 Bilibili 域名，终态 HTML 不请求——已验证（离线测试）。
+  - 定向读取请求量只与楼中楼页数相关，不出现主评论翻页（`root_pages_fetched=0`），不调用 nav/WBI/main——已验证（离线测试 + 真实 smoke）。
+  - 缺 `comment_root_id` 或 focus 冲突 fail closed，不退回全量；根无效时 `complete=false` 且不声称永久删除——已验证（离线测试）。
+  - 输出 schema 1.1；`complete/diagnostics/exit 0/1/2` 语义与 legacy 一致——已验证。
+  - 验证基线：`129 passed`、覆盖率 89%；匿名真实 CLI smoke：1 根评论 + 1 回复、`root_pages_fetched=0`、`complete=true`。
+- **非范围**：SQLite、认证身份、通知、LLM、写接口。
 
-### 2. AI 决策与生成
+### M2 本地认证与 viewer 身份（planned）
 
-- **目标**：消费评论树与对话链上下文，决定是否回复并生成待审核草稿。
-- **前置依赖**：SQLite 增量去重提供稳定历史与去重输入。
-- **最低验收方向/安全门**：先有可评估的 prompt/eval 与明确的输入输出契约；生成内容一律标记为草稿，不直接对外发送。
-- **不在上一阶段偷跑**：SQLite 阶段不加入 AI 依赖或生成逻辑。
+- **目标**：本地 authenticated session + 当前 viewer 身份（`platform_user_id` / B 站 mid），而不是只有 Cookie 文本；用户名仅展示；凭证不暴露给模型、不写进日志。
+- **前置依赖**：M1（输入与定向读取链路）。
+- **最低验收（安全门）**：匿名/登录两种 viewer 可区分；`is_self` 在输出时按 `author_id == viewer.platform_user_id` 派生；匿名为 unknown/null，不默认为 false；凭证不出现在模型上下文与日志。
+- **非范围**：通知读取、SQLite 全量迁移、写接口。
 
-### 3. 人工审核
+### M3 SQLite 持久化与同步语义（planned）
 
-- **目标**：审阅、修改或拒绝 AI 草稿，只有通过审核的内容才能进入回复队列。
-- **前置依赖**：AI 能产出草稿；需要审核界面/入口与状态流转。
-- **最低验收方向/安全门**：任何自动回复候选都必须有“未经审核不得发送”的强制约束；审核动作可追踪。
-- **不在上一阶段偷跑**：AI 阶段不实现自动发送，也不假设审核界面已存在。
+- **目标**：只持久化用户选中的讨论；实体至少含 viewer（`platform_user_id`）、discussions（身份与 viewer 无关）、comments（关系、作者、内容；唯一约束 `(discussion_id, platform_comment_id)`，不含 `is_self`/单一 visibility；comment/display 字段与平台线协议字段隔离）、discussion_viewer_state（`(discussion_id, viewer_id)`、绑定/追踪状态、`last_complete` baseline）、comment_observation（`(discussion_id, viewer_id, comment_id)`、first_seen/last_seen/current visibility 仅 `visible / not_currently_visible`）、sync_runs（viewer + discussion、observed_ids、complete、diagnostics）、notification_sync_state、reply_events（含独立 `target_availability`：unknown / available / unavailable，与事件状态正交）、outbound_replies/outbox。
+- 同步语义：每次 sync_run 记录 `observed_ids`；对 `(viewer_id, discussion_id)` 持久化 `ever_seen_ids` 与 `last_complete_visible_ids`；开始本轮前 `previous_visible_ids = last_complete_visible_ids`；无论 complete 与否，`newly_observed = observed_ids − ever_seen_before` 后并入 ever_seen；`complete=true` 时 `current_visible_ids = observed_ids`、`not_currently_visible = previous − current` 并更新 baseline，可见性只写 `visible / not_currently_visible`、差集只能推进 `not_currently_visible` 且不证明删除；`complete=false` 时**不替换 baseline、不计算缺失/删除/当前不可见差集**，只保留新观察与诊断；`unavailable` 不是 `current_visibility` 的值，而是 `reply_event.target_availability` 的值，不证明永久删除。
+- **前置依赖**：M2（viewer 身份）。
+- **最低验收（安全门）**：事务与唯一约束生效；崩溃后可恢复；同 viewer 完整同步产生正确的可见性 diff（含 baseline 更新）；不完整同步不产生删除/当前不可见推断、不替换 baseline；`comment_observation.current_visibility` 不出现 `unavailable`，`reply_event.target_availability` 与事件状态独立存储；跨小时多讨论可查询；旧 `comments.json` 不作为产品数据迁移（仅诊断用）。
+- **非范围**：通知发现、LLM、写接口。
 
-### 4. 自动回复
+### M4 通知事件与“有人回复我”（planned）
 
-- **目标**：仅发送审核通过的内容，并做好限速、幂等与审计。
-- **前置依赖**：人工审核流程可用；写接口与权限边界明确。
-- **最低验收方向/安全门**：写操作只允许出现在这一步；回复必须有幂等/去重机制，防止重复发送；所有发送记录可审计；回复接口变化仍隔离在 Adapter 边界内。
-- **不在上一阶段偷跑**：审核阶段不实现真实发送，也不预先向远端写入。
+- **目标**：按需读取当前账号“回复我的”通知（目标方向可参考 `/x/msgfeed/reply`；@ 通知作为后续/相邻输入）；本地追加式 reply-event ledger（稳定键优先级：远端 event id → source reply rpid → 复合键 `(viewer, object_type, oid, root, source, target, author, time)`）。
+- 候选回复 = “新通知事件” ∪ “新发现且结构上回复自己评论的评论”，按 source comment id 去重；受影响讨论按 root 分组，每个根一次同步。复合稳定键中未知/缺失字段按规范化/可空策略处理，不因字段缺失生成新 key；`reply_event.discussion_id` 刚观察到可空、成功解析/同步后回填。
+- 通知只是发现来源，重新抓取的根讨论才是上下文事实；禁止“两个通知快照相减并要求匹配”。
+- 事件保留与可用性分离：`reply_event` 观察到后本地持久保留；远端通知 feed 中缺席单独不构成状态变化、不表示删除，也不改变 `current_visibility` 或 `target_availability`。刚观察到且尚未同步时 `target_availability=unknown`，上下文准备成功后为 `available`；只有重新同步根讨论后，目标评论在“相同 viewer + 本轮 `complete=true`”条件下当前不可见（`comment_observation.current_visibility` 写 `not_currently_visible`，`target_availability` 可写 `unavailable`），或接口明确返回目标不存在/不可访问（也可写 `unavailable`），才可把 `target_availability` 标为 `unavailable`；`unavailable` 不是 `current_visibility` 的值，也不证明永久删除。通知与评论均在首次观察前消失则无法恢复，是明确限制。
+- **前置依赖**：M2（viewer）、M3（ledger 存储）。
+- **最低验收（安全门）**：重叠扫描不产生重复事件；同一事件在远端通知 feed 缺席后状态不变、仍保留（feed 缺席不改变事件与 `target_availability`）；刚观察到未同步时 `target_availability=unknown`，上下文准备成功后为 `available`；只有在完整讨论同步确认目标当前不可见（`current_visibility=not_currently_visible`，`target_availability` 可写 `unavailable`）或接口明确返回不存在/不可访问时才标 `unavailable`，且 `current_visibility` 不出现 `unavailable`；每个受影响根只同步一次。
+- **非范围**：整评论区轮询、自动回复；轻量定时轮询仅作为以后可选项记录。
 
-## 远期候选或待决策能力（不承诺、不编日期）
+### M5 LLM/MCP/CLI 上下文（planned）
 
-- 多平台支持（YouTube、抖音等）。
-- 前端/管理界面（审核 UI 是自动回复前的必要能力，但具体形态待决策）。
-- 调度与部署（定时增量抓取、任务队列等）。
+- **目标**：三个工具能力——打开并同步指定讨论、获取待回复上下文、确认后发送一条回复（写能力本阶段只建契约，不实现发送）。前两项是统一 read/context 能力的两种入口；权限上区分公共读取、私有通知读取与写操作。
+- 上下文结构：discussion metadata、viewer、focus/targets、完整树或扁平列表+关系、参与者证据汇总、可见性 diff、新通知事件、完整性/诊断；画像与意图字段必须标记为 LLM 推断，不作为存储事实。
+- 模型不传递 `aid / root / parent / csrf / Cookie`；这些参数由 Writer/Adapter 从数据库与当前同步推导。
+- 外部不可信数据边界：评论正文、用户名、通知内容、视频元数据与参与者证据只作为被引用证据，不作为系统/用户指令，不得提升权限、改变工具策略或触发写操作；模型生成内容始终是草稿。
+- **前置依赖**：M3（上下文组装）、M4（待回复候选）。
+- **最低验收（安全门）**：同一根讨论两次调用返回稳定上下文；模型输入不含凭证与线协议参数；提示注入文本不能改变工具策略、提升权限或触发写调用；推断字段有明确标签。
+- **非范围**：真实发送、浏览器 UI 自动化、审核界面之外的存储形态。
 
-以上只是候选方向，需要需求明确并通过 Comet change 决策后才会进入实施。
+### M6 确认式 Writer（planned）
 
-## 必须通过 Comet change 决定的开放问题
+- **目标**：outbox 状态机 `prepared / confirmed / sending / succeeded / unknown / retryable_failed / terminal_failed`；保存 idempotency key、based_on_sync、target、content/hash、返回的新 posted rpid。`post_comment_reply` 的 `idempotency_key` 必须解析到已持久化且字段一致的 `confirmed` outbox 记录（含确认来源/时间），确认式 outbox 成为发送的强制门。
+- 写前校验：当前 viewer 与该讨论存在绑定/追踪关系（discussion_viewer_state）；目标仍存在/可回复（以最近完整同步或明确接口结果为准）；based_on_sync 未过期或显式重同步；人工确认是发送前的强制门，并记录确认来源/时间；`idempotency_key` 解析到的 outbox 记录必须与参数一致（discussion_id、target_comment_id、content/hash、based_on_sync_id）且状态为 `confirmed`。
+- 工具内部必须有 confirmed outbox/确认记录（确认来源、时间）；`post_comment_reply` 以 `idempotency_key` 解析到该记录，找不到记录、字段不匹配或状态未 `confirmed` 一律拒绝、不发送。`post_comment_reply` 参数外观保持 `discussion_id / target_comment_id / content / based_on_sync_id / idempotency_key`，不新增第四个工具；外部不可信内容（含提示注入文本）不得触发写操作。
+- POST 超时可能已经成功：先标 `unknown`，不盲重试；按账号、parent、内容哈希与时间窗口同步讨论协调。只有成功、用户明确忽略或终止性失效才结束事件。
+- root/parent 等线协议参数由 Writer 从数据库与当前完整同步推导；必须以捕获或最小授权实测确认，不依赖参考项目内部实现。
+- 读取与写入隔离：可共享低层 HTTP 会话，但 Writer 独立；写请求不使用普通 GET 的自动重试策略。
+- **前置依赖**：M3、M5；线协议实测。
+- **最低验收（安全门）**：只发送 `idempotency_key` 能解析到字段一致且 `confirmed` 的 outbox 记录的回复；找不到记录、字段不匹配或未 `confirmed` 均被拒绝并记录；提示注入文本不能触发写操作；重复提交不产生重复发送；unknown 可收敛；发送记录与确认记录（来源、时间）可审计。
+- **非范围**：无确认自动发言、模糊结果自动重试、浏览器自动化、批量群发。
 
-- 存储 schema、增量游标与去重语义。
-- AI provider 选型、prompt/eval 与失败策略。
-- 审核界面形态与审核状态模型。
-- 回复权限、限速、幂等与审计要求。
-- 多平台抽象与 Adapter 边界如何扩展。
-- 每个新里程碑的验收标准与安全门。
+### M7 加固与运行模式（planned）
 
-未列入 roadmap 的能力同样需要单独决策；路线图不授权提前编码。
+- **目标**：结构化风控（`412 / -799 / -509` 等分类 + 保守冷却）；写请求与读请求重试策略隔离；请求量上限为“一个通知窗口 + 少量受影响根讨论”；轻量定时轮询作为可选项；明确退役或保留全量抓取 CLI。
+- **前置依赖**：M1–M6。
+- **最低验收（安全门）**：节流与冷却可测；诊断可审计；文档与代码状态一致。
+- **非范围**：整站/整视频数据管道、模型训练、长期画像引擎、无人监管自动发言。
+
+## 跨里程碑开放问题（需 Comet change 或实测决定）
+
+- 通知接口的字段与分页（参考 `/x/msgfeed/reply`，需实测）。
+- 回复写接口与 root/parent 线协议（参考项目内部实现有分歧，需实测）。
+- LLM provider、CLI/MCP 表面形态与提示契约。
+- 全量抓取 CLI 的退役或保留决定。
+- 定时轮询的节奏与范围（MVP 默认按需）。
+
+## 明确的非目标（全程适用）
+
+- 整视频/整站评论数据集、模型训练、复杂长期用户画像引擎。
+- 浏览器 UI 自动化、无人监管的大规模自动争论/群发。
+- 恢复从未观察到且已删除的数据。
+- 把 roadmap 内容提前实现为当前能力。

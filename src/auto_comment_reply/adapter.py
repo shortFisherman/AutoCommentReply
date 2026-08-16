@@ -9,7 +9,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qsl, urljoin, urlparse
 
 import httpx
 
@@ -26,6 +26,12 @@ from .errors import (
     ResponseParseError,
 )
 from .models import Comment, Diagnostic, FetchResult, FetchStats, VideoInfo
+from .reference import (
+    DiscussionReference,
+    build_discussion_reference,
+    parse_comment_reference,
+    validate_url_authority,
+)
 from .wbi import derive_mixin_key, sign_wbi_params
 
 logger = logging.getLogger(__name__)
@@ -39,6 +45,8 @@ CHILD_REPLY_ENDPOINT = f"{API_BASE}/x/v2/reply/reply"
 _BVID_RE = re.compile(r"BV[0-9A-Za-z]{10}")
 _AID_RE = re.compile(r"(?:^|/)(?:av)?(?P<aid>[1-9][0-9]*)(?:$|[/?#])", re.IGNORECASE)
 _ALLOWED_BILIBILI_HOSTS = {"bilibili.com", "www.bilibili.com", "m.bilibili.com", "b23.tv"}
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+_MAX_SHORT_LINK_HOPS = 5
 
 
 class BilibiliAdapter:
@@ -183,6 +191,334 @@ class BilibiliAdapter:
             stats=stats,
         )
 
+    def fetch_reference(self, reference: str) -> FetchResult:
+        """Dispatch one input to discussion-sync or legacy full-video modes."""
+        raw = reference.strip()
+        if not raw:
+            raise ParameterError("输入不能为空。")
+        candidate = raw if "://" in raw else f"https://{raw}"
+        host = (urlparse(candidate).hostname or "").lower()
+        if host == "b23.tv":
+            original_has_marker = self._url_has_comment_marker(candidate)
+            expanded = self._resolve_short_link(candidate)
+            expanded_has_marker = self._url_has_comment_marker(expanded)
+            if original_has_marker or expanded_has_marker:
+                return self.fetch_discussion(expanded)
+            return self.fetch(expanded)
+        if host and self._is_allowed_bilibili_host(host):
+            if self._url_has_comment_marker(candidate):
+                return self.fetch_discussion(candidate)
+            return self.fetch(candidate)
+        return self.fetch(raw)
+
+    def fetch_discussion(self, comment_share_link: str) -> FetchResult:
+        """Strictly sync one root discussion addressed by a comment share link.
+
+        The root comment itself and its first reply page come from one
+        ``/x/v2/reply/reply`` call. The main comment endpoint is never used.
+        """
+        raw = comment_share_link.strip()
+        if not raw:
+            raise ParameterError("评论链接不能为空。")
+        candidate = raw if "://" in raw else f"https://{raw}"
+        parsed_candidate = urlparse(candidate)
+        validate_url_authority(parsed_candidate, context="评论链接")
+        host = (parsed_candidate.hostname or "").lower()
+        if host == "b23.tv":
+            candidate = self._resolve_short_link(candidate)
+            parsed_candidate = urlparse(candidate)
+            validate_url_authority(parsed_candidate, context="评论链接")
+            host = (parsed_candidate.hostname or "").lower()
+        if not self._is_allowed_bilibili_host(host):
+            raise ParameterError("只接受 Bilibili 评论链接或 b23.tv 短链。")
+
+        comment_reference = parse_comment_reference(candidate)
+        video = self.resolve_video(candidate)
+        discussion = build_discussion_reference(video, comment_reference)
+
+        stats = FetchStats()
+        diagnostics: list[Diagnostic] = []
+        scope = f"root:{discussion.root_comment_id}:replies"
+
+        try:
+            data = self._request_api(
+                CHILD_REPLY_ENDPOINT,
+                params={
+                    "oid": video.aid,
+                    "type": 1,
+                    "root": discussion.root_comment_id,
+                    "pn": 1,
+                    "ps": 20,
+                },
+                scope=scope,
+            )
+        except BilibiliError as error:
+            diagnostics.append(self._diagnostic_from_error(error, scope=scope))
+            return self._finalize_discussion_result(
+                video=video,
+                discussion=discussion,
+                comments={},
+                diagnostics=diagnostics,
+                stats=stats,
+            )
+
+        if not isinstance(data, Mapping):
+            diagnostics.append(
+                Diagnostic(
+                    severity="error",
+                    category="response_parse",
+                    scope=scope,
+                    message="楼中楼接口缺少 data 对象。",
+                )
+            )
+            return self._finalize_discussion_result(
+                video=video,
+                discussion=discussion,
+                comments={},
+                diagnostics=diagnostics,
+                stats=stats,
+            )
+
+        stats.reply_pages_fetched += 1
+
+        root_valid = True
+        root_comment: Comment | None = None
+        raw_root = data.get("root")
+        if not isinstance(raw_root, Mapping):
+            root_valid = False
+            diagnostics.append(
+                Diagnostic(
+                    severity="error",
+                    category="root_metadata_missing",
+                    scope=scope,
+                    message="楼中楼响应缺少目标根评论 data.root 对象。",
+                    details={"root_comment_id": discussion.root_comment_id},
+                )
+            )
+        elif self._is_invisible_flag(raw_root.get("invisible")):
+            root_valid = False
+            diagnostics.append(
+                Diagnostic(
+                    severity="error",
+                    category="root_not_visible",
+                    scope=scope,
+                    message=(
+                        "目标根评论当前不可见（invisible=true），本轮不视为完整同步；"
+                        "这不代表评论已删除。"
+                    ),
+                    details={"root_comment_id": discussion.root_comment_id},
+                )
+            )
+        else:
+            root_comment = self._parse_comment(
+                raw_root,
+                video_id=video.bvid,
+                scope=f"root:{discussion.root_comment_id}:metadata",
+                diagnostics=diagnostics,
+            )
+            if root_comment is None:
+                root_valid = False
+            elif root_comment.comment_id != discussion.root_comment_id:
+                root_valid = False
+                diagnostics.append(
+                    Diagnostic(
+                        severity="error",
+                        category="root_id_mismatch",
+                        scope=scope,
+                        message="楼中楼响应返回的根评论与请求的 root_comment_id 不一致。",
+                        details={
+                            "requested_root_comment_id": discussion.root_comment_id,
+                            "actual_rpid": root_comment.comment_id,
+                        },
+                    )
+                )
+            elif not root_comment.is_root:
+                root_valid = False
+                diagnostics.append(
+                    Diagnostic(
+                        severity="error",
+                        category="root_relationship_invalid",
+                        scope=scope,
+                        message="目标根评论的 root/parent 关系不是根节点。",
+                        details={
+                            "root_id": root_comment.root_id,
+                            "parent_id": root_comment.parent_id,
+                        },
+                    )
+                )
+
+        page = data.get("page")
+        expected_reply_count: int | None = None
+        if isinstance(page, Mapping):
+            api_count = self._optional_int(page.get("count"))
+            if api_count is not None:
+                expected_reply_count = api_count
+                if root_comment is not None and api_count != root_comment.reply_count:
+                    diagnostics.append(
+                        Diagnostic(
+                            severity="warning",
+                            category="count_changed",
+                            scope=scope,
+                            message="根评论 rcount 与楼中楼接口 page.count 不一致，"
+                            "以接口计数继续判断分页。",
+                            details={
+                                "rcount": root_comment.reply_count,
+                                "page_count": api_count,
+                            },
+                        )
+                    )
+        if expected_reply_count is None and root_comment is not None:
+            expected_reply_count = root_comment.reply_count
+        if root_valid and expected_reply_count is not None:
+            stats.expected_total_comments = 1 + expected_reply_count
+
+        comments: dict[int, Comment] = {}
+        if root_valid and root_comment is not None:
+            self._upsert_comment(comments, root_comment, diagnostics=diagnostics, stats=stats)
+        if "replies" not in data:
+            diagnostics.append(
+                Diagnostic(
+                    severity="error",
+                    category="response_parse",
+                    scope=scope,
+                    message="楼中楼响应缺少 replies 字段。",
+                )
+            )
+            return self._finalize_discussion_result(
+                video=video,
+                discussion=discussion,
+                comments=comments,
+                diagnostics=diagnostics,
+                stats=stats,
+            )
+
+        raw_replies = data.get("replies") or []
+        if not isinstance(raw_replies, list):
+            diagnostics.append(
+                Diagnostic(
+                    severity="error",
+                    category="response_parse",
+                    scope=scope,
+                    message="楼中楼响应中的 replies 不是列表。",
+                )
+            )
+            return self._finalize_discussion_result(
+                video=video,
+                discussion=discussion,
+                comments=comments,
+                diagnostics=diagnostics,
+                stats=stats,
+            )
+
+        parsed_page_replies: list[Comment] = []
+        for raw_item in raw_replies:
+            comment = self._parse_comment(
+                raw_item,
+                video_id=video.bvid,
+                scope=f"root:{discussion.root_comment_id}:reply_page:1",
+                diagnostics=diagnostics,
+            )
+            if comment is None:
+                continue
+            parsed_page_replies.append(comment)
+
+        kept_replies = [
+            comment
+            for comment in parsed_page_replies
+            if comment.root_id == discussion.root_comment_id
+        ]
+        excluded_root_ids = sorted(
+            {
+                comment.root_id
+                for comment in parsed_page_replies
+                if comment.root_id != discussion.root_comment_id
+            }
+        )
+        if excluded_root_ids:
+            diagnostics.append(
+                Diagnostic(
+                    severity="warning",
+                    category="foreign_root_reply_excluded",
+                    scope=scope,
+                    message="楼中楼响应包含不属于目标根讨论的回复，已排除。",
+                    details={
+                        "excluded_count": len(parsed_page_replies) - len(kept_replies),
+                        "excluded_root_ids": excluded_root_ids,
+                    },
+                )
+            )
+
+        for reply in kept_replies:
+            self._upsert_comment(comments, reply, diagnostics=diagnostics, stats=stats)
+
+        if not root_valid:
+            return self._finalize_discussion_result(
+                video=video,
+                discussion=discussion,
+                comments=comments,
+                diagnostics=diagnostics,
+                stats=stats,
+            )
+
+        seen_api_ids = {reply.comment_id for reply in kept_replies}
+        seen_page_fingerprints: set[tuple[int, ...]] = set()
+        if seen_api_ids:
+            seen_page_fingerprints.add(tuple(reply.comment_id for reply in kept_replies))
+
+        if (
+            not raw_replies
+            and expected_reply_count is not None
+            and len(seen_api_ids) < expected_reply_count
+        ):
+            diagnostics.append(
+                Diagnostic(
+                    severity="error",
+                    category="pagination_incomplete",
+                    scope=scope,
+                    message="楼中楼在达到接口总数前提前返回空页。",
+                    details={
+                        "expected": expected_reply_count,
+                        "actual": len(seen_api_ids),
+                        "page": 1,
+                    },
+                )
+            )
+            return self._finalize_discussion_result(
+                video=video,
+                discussion=discussion,
+                comments=comments,
+                diagnostics=diagnostics,
+                stats=stats,
+            )
+
+        if expected_reply_count is None or len(seen_api_ids) < expected_reply_count:
+            try:
+                self._fetch_reply_pages(
+                    video=video,
+                    root=root_comment,
+                    comments=comments,
+                    diagnostics=diagnostics,
+                    stats=stats,
+                    start_page=2,
+                    seen_api_ids=seen_api_ids,
+                    seen_page_fingerprints=seen_page_fingerprints,
+                    expected_count=expected_reply_count,
+                )
+            except BilibiliError as error:
+                diagnostics.append(self._diagnostic_from_error(error, scope=scope))
+        else:
+            self._warn_on_reply_count_drift(
+                discussion.root_comment_id, expected_reply_count, seen_api_ids, diagnostics
+            )
+
+        return self._finalize_discussion_result(
+            video=video,
+            discussion=discussion,
+            comments=comments,
+            diagnostics=diagnostics,
+            stats=stats,
+        )
+
     def resolve_video(self, video_reference: str) -> VideoInfo:
         """Resolve BV/AV/numeric/Bilibili URL input to stable video metadata."""
 
@@ -244,12 +580,13 @@ class BilibiliAdapter:
 
         if host == "b23.tv":
             candidate = self._resolve_short_link(candidate)
+            parsed = urlparse(candidate)
 
-        bvid_match = _BVID_RE.search(candidate)
+        bvid_match = _BVID_RE.search(parsed.path)
         if bvid_match:
             return ("bvid", bvid_match.group(0))
 
-        aid_match = _AID_RE.search(urlparse(candidate).path)
+        aid_match = _AID_RE.search(parsed.path)
         if aid_match:
             return ("aid", int(aid_match.group("aid")))
 
@@ -259,23 +596,89 @@ class BilibiliAdapter:
     def _is_allowed_bilibili_host(host: str) -> bool:
         return host in _ALLOWED_BILIBILI_HOSTS or host.endswith(".bilibili.com")
 
+    @staticmethod
+    def _url_has_comment_marker(url: str) -> bool:
+        """Detect any comment marker case-insensitively so routing never silently downgrades."""
+        parsed = urlparse(url)
+        query_names = {
+            name.lower() for name, _value in parse_qsl(parsed.query, keep_blank_values=True)
+        }
+        if {"comment_root_id", "comment_secondary_id"} & query_names:
+            return True
+        fragment = parsed.fragment.strip()
+        return bool(fragment) and fragment.lower().startswith("reply")
+
+    @staticmethod
+    def _is_invisible_flag(value: Any) -> bool:
+        if value is True:
+            return True
+        if isinstance(value, str):
+            return value.strip().lower() in {"true", "1"}
+        return value == 1
+
+    def _finalize_discussion_result(
+        self,
+        *,
+        video: VideoInfo,
+        discussion: DiscussionReference,
+        comments: dict[int, Comment],
+        diagnostics: list[Diagnostic],
+        stats: FetchStats,
+    ) -> FetchResult:
+        normalized = list(comments.values())
+        stats.root_comments_fetched = sum(item.is_root for item in normalized)
+        stats.reply_comments_fetched = len(normalized) - stats.root_comments_fetched
+        stats.total_comments_fetched = len(normalized)
+        self._warn_on_total_count_drift(normalized, diagnostics, stats)
+        complete = not any(item.severity == "error" for item in diagnostics)
+        return FetchResult(
+            video=video,
+            comments=normalized,
+            complete=complete,
+            diagnostics=diagnostics,
+            stats=stats,
+            discussion=discussion,
+        )
+
     def _resolve_short_link(self, initial_url: str) -> str:
-        """Follow a b23 redirect without ever requesting an untrusted redirect target."""
+        """Resolve b23 redirects safely without requesting the final target.
+
+        Every hop must be a valid http(s) Location on b23.tv until the first
+        non-b23 target, which must be an allowed Bilibili host. That final URL
+        is returned for parsing and is never requested here.
+        """
 
         current_url = initial_url
-        for _redirect in range(5):
-            response = self._http_get(current_url, scope="short_link")
-            if response.status_code not in {301, 302, 303, 307, 308}:
-                return str(response.url)
+        seen_urls: set[str] = set()
+        for _hop in range(_MAX_SHORT_LINK_HOPS):
+            if current_url in seen_urls:
+                raise ParameterError("b23.tv 短链跳转出现循环，已拒绝继续处理。")
+            seen_urls.add(current_url)
+            validate_url_authority(urlparse(current_url), context="b23.tv 短链")
+            try:
+                response = self._http_get(current_url, scope="short_link")
+            except NetworkError as error:
+                if isinstance(error.__cause__, httpx.RemoteProtocolError):
+                    raise ParameterError(
+                        "b23.tv 短链跳转协议畸形，已拒绝继续处理。"
+                    ) from error.__cause__
+                raise
+            if response.status_code not in _REDIRECT_STATUSES:
+                raise ParameterError("b23.tv 短链未返回有效的跳转响应。")
 
             location = response.headers.get("Location")
             if not location:
                 raise ParameterError("b23.tv 返回了不含 Location 的跳转响应。")
             next_url = urljoin(str(response.url), location)
-            next_host = (urlparse(next_url).hostname or "").lower()
+            parsed_next = urlparse(next_url)
+            validate_url_authority(parsed_next, context="b23.tv 跳转目标")
+            next_host = (parsed_next.hostname or "").lower()
+            if next_host == "b23.tv":
+                current_url = next_url
+                continue
             if not self._is_allowed_bilibili_host(next_host):
                 raise ParameterError("b23.tv 短链跳转到了非 Bilibili 地址，已拒绝继续处理。")
-            current_url = next_url
+            return next_url
 
         raise ParameterError("b23.tv 短链跳转次数超过安全上限。")
 
@@ -449,10 +852,33 @@ class BilibiliAdapter:
         diagnostics: list[Diagnostic],
         stats: FetchStats,
     ) -> bool:
-        page_number = 1
-        expected_count = root.reply_count
-        seen_api_ids: set[int] = set()
-        seen_page_fingerprints: set[tuple[int, ...]] = set()
+        return self._fetch_reply_pages(
+            video=video,
+            root=root,
+            comments=comments,
+            diagnostics=diagnostics,
+            stats=stats,
+            start_page=1,
+        )
+
+    def _fetch_reply_pages(
+        self,
+        *,
+        video: VideoInfo,
+        root: Comment,
+        comments: dict[int, Comment],
+        diagnostics: list[Diagnostic],
+        stats: FetchStats,
+        start_page: int,
+        seen_api_ids: set[int] | None = None,
+        seen_page_fingerprints: set[tuple[int, ...]] | None = None,
+        expected_count: int | None = None,
+    ) -> bool:
+        page_number = start_page
+        if expected_count is None:
+            expected_count = root.reply_count
+        seen_api_ids = set() if seen_api_ids is None else seen_api_ids
+        seen_page_fingerprints = set() if seen_page_fingerprints is None else seen_page_fingerprints
 
         while True:
             if page_number > self._max_reply_pages:

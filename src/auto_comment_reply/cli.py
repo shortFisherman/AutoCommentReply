@@ -1,4 +1,4 @@
-"""Read-only command-line entry point for MVP1."""
+"""Read-only command-line entry point."""
 
 from __future__ import annotations
 
@@ -18,9 +18,18 @@ from .output import build_output_document
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="auto-comment-reply",
-        description="完整读取一条 Bilibili 视频的可见评论树（MVP1，只读）。",
+        description=(
+            "只读读取 Bilibili 评论：评论分享链接自动定向同步单条讨论，"
+            "视频引用仍按旧模式完整读取评论树。"
+        ),
     )
-    parser.add_argument("video", help="BV 号、AV 号、数字 aid、视频链接或 b23.tv 短链")
+    parser.add_argument(
+        "reference",
+        help=(
+            "评论分享链接（b23.tv 短链或展开 URL，自动定向同步）或视频引用"
+            "（BV 号、AV 号、数字 aid、视频 URL、b23.tv 短链）"
+        ),
+    )
     parser.add_argument(
         "-o",
         "--output",
@@ -51,7 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-root-pages",
         type=int,
         default=10_000,
-        help="主评论分页安全上限；触发后输出标记为不完整",
+        help="主评论分页安全上限；仅全量视频模式生效，触发后输出标记为不完整",
     )
     parser.add_argument(
         "--max-reply-pages",
@@ -131,7 +140,7 @@ def main(argv: list[str] | None = None) -> int:
             max_root_pages=args.max_root_pages,
             max_reply_pages=args.max_reply_pages,
         ) as adapter:
-            result = adapter.fetch(args.video)
+            result = adapter.fetch_reference(args.reference)
 
         document = build_output_document(result)
         indent = None if args.compact else 2

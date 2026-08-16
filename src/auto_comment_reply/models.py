@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    from .reference import DiscussionReference
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,3 +113,4 @@ class FetchResult:
     complete: bool
     diagnostics: list[Diagnostic]
     stats: FetchStats
+    discussion: DiscussionReference | None = None

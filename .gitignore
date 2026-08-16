@@ -18,6 +18,7 @@ auth.json
 
 # Generated comment exports
 comments*.json
+discussion*.json
 
 # >>> Comet managed project state >>>
 !/.comet/

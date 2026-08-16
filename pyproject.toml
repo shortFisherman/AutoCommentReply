@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "auto-comment-reply"
 version = "0.1.0"
-description = "Read a complete Bilibili comment tree without performing remote writes."
+description = "Read-only Bilibili comment context: targeted discussion sync via share links, plus legacy full-video tree reads."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -35,4 +35,3 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
-

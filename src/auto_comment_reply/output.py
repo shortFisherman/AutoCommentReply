@@ -9,7 +9,8 @@ from typing import Any
 from .models import FetchResult
 from .tree import build_comment_forest
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION_LEGACY = "1.0"
+SCHEMA_VERSION_DISCUSSION = "1.1"
 
 
 def build_output_document(
@@ -31,11 +32,18 @@ def build_output_document(
         timestamp = timestamp.replace(tzinfo=UTC)
 
     comments = sorted(result.comments, key=lambda item: (item.created_at, item.comment_id))
-    return {
-        "schema_version": SCHEMA_VERSION,
+    schema_version = (
+        SCHEMA_VERSION_DISCUSSION if result.discussion is not None else SCHEMA_VERSION_LEGACY
+    )
+    head: dict[str, Any] = {
+        "schema_version": schema_version,
         "generated_at": timestamp.astimezone(UTC).isoformat().replace("+00:00", "Z"),
         "complete": complete,
         "video": result.video.to_dict(),
+    }
+    if result.discussion is not None:
+        head["discussion"] = result.discussion.to_dict()
+    tail: dict[str, Any] = {
         "stats": stats,
         "comments": [comment.to_dict() for comment in comments],
         "trees": [tree.to_dict() for tree in graph.trees],
@@ -44,6 +52,7 @@ def build_output_document(
         "duplicate_comment_ids": graph.duplicate_comment_ids,
         "diagnostics": [item.to_dict() for item in diagnostics],
     }
+    return {**head, **tail}
 
 
 def render_json(result: FetchResult, *, indent: int | None = 2) -> str:

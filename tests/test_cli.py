@@ -8,9 +8,14 @@ import pytest
 from auto_comment_reply import cli
 from auto_comment_reply.errors import ParameterError
 from auto_comment_reply.models import Comment, Diagnostic, FetchResult, FetchStats, VideoInfo
+from auto_comment_reply.reference import DiscussionReference
 
 
-def make_result(*, complete: bool) -> FetchResult:
+def make_result(
+    *,
+    complete: bool,
+    discussion: DiscussionReference | None = None,
+) -> FetchResult:
     diagnostics = []
     if not complete:
         diagnostics.append(
@@ -49,6 +54,7 @@ def make_result(*, complete: bool) -> FetchResult:
             root_comments_fetched=1,
             total_comments_fetched=1,
         ),
+        discussion=discussion,
     )
 
 
@@ -63,8 +69,8 @@ def fake_adapter_class(result: FetchResult | Exception, captured: dict[str, obje
         def __exit__(self, *_args: object) -> None:
             return None
 
-        def fetch(self, video: str) -> FetchResult:
-            captured["video"] = video
+        def fetch_reference(self, reference: str) -> FetchResult:
+            captured["reference"] = reference
             if isinstance(result, Exception):
                 raise result
             return result
@@ -86,8 +92,41 @@ def test_cli_complete_result_prints_json_and_returns_zero(
     document = json.loads(capsys.readouterr().out)
     assert exit_code == 0
     assert document["complete"] is True
-    assert captured["video"] == "BV1xx411c7mD"
+    assert captured["reference"] == "BV1xx411c7mD"
     assert captured["cookie"] is None
+
+
+def test_cli_share_link_dispatches_targeted_fetch_and_exposes_discussion(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    captured: dict[str, object] = {}
+    result = make_result(
+        complete=True,
+        discussion=DiscussionReference(
+            platform="bilibili",
+            object_type="video",
+            aid=42,
+            bvid="BV1xx411c7mD",
+            root_comment_id=100,
+            focus_comment_id=None,
+        ),
+    )
+    monkeypatch.setattr(cli, "BilibiliAdapter", fake_adapter_class(result, captured))
+    monkeypatch.delenv("BILIBILI_COOKIE", raising=False)
+
+    link = "https://www.bilibili.com/video/BV1xx411c7mD/?comment_root_id=100"
+    exit_code = cli.main([link, "--compact", "--quiet"])
+
+    document = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert captured["reference"] == link
+    assert document["discussion"]["root_comment_id"] == 100
+    assert document["discussion"]["identity"] == {
+        "platform": "bilibili",
+        "object_type": "video",
+        "oid": 42,
+        "root_comment_id": 100,
+    }
 
 
 def test_cli_incomplete_result_is_written_and_returns_two(

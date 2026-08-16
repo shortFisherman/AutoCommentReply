@@ -46,6 +46,13 @@ def raw_comment(
     return item
 
 
+def share_url(root: int, *, focus: int | None = None, bvid: str = BVID) -> str:
+    url = f"https://www.bilibili.com/video/{bvid}/?comment_root_id={root}"
+    if focus is not None:
+        url = f"{url}&comment_secondary_id={focus}"
+    return url
+
+
 def view_data() -> dict[str, Any]:
     return {
         "aid": 42,
@@ -156,6 +163,7 @@ def test_fetches_all_root_and_child_pages_and_builds_multilevel_tree() -> None:
 
     document = build_output_document(result)
     assert document["complete"] is True
+    assert document["schema_version"] == "1.0"
     assert document["stats"]["root_pages_fetched"] == 2
     assert document["stats"]["reply_pages_fetched"] == 3
     assert document["stats"]["root_comments_fetched"] == 3
@@ -680,3 +688,836 @@ def test_non_bilibili_url_with_bvid_text_is_rejected_without_request() -> None:
             adapter.resolve_video(f"https://example.com/{BVID}")
 
     assert requested is False
+
+
+def test_fetch_reference_expanded_comment_link_targets_one_root_without_main_or_nav() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        path = request.url.path
+        if path == "/x/web-interface/view":
+            return api_response(request, view_data())
+        if path == "/x/v2/reply/reply":
+            assert request.url.params["oid"] == "42"
+            assert request.url.params["root"] == "100"
+            assert request.url.params["pn"] == "1"
+            return api_response(
+                request,
+                {
+                    "page": {"num": 1, "size": 20, "count": 0},
+                    "root": raw_comment(100),
+                    "replies": [],
+                },
+            )
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    with make_client(handler) as client:
+        result = BilibiliAdapter(client=client, request_delay=0, retries=0).fetch_reference(
+            share_url(100)
+        )
+
+    document = build_output_document(result)
+    assert result.complete is True
+    assert [item.comment_id for item in result.comments] == [100]
+    assert result.discussion is not None
+    assert result.discussion.identity == ("bilibili", "video", 42, 100)
+    assert document["schema_version"] == "1.1"
+    assert document["discussion"]["oid"] == 42
+    assert document["discussion"]["focus_comment_id"] is None
+    assert document["stats"]["root_pages_fetched"] == 0
+    assert document["stats"]["reply_pages_fetched"] == 1
+    assert len(document["trees"]) == 1
+    assert document["trees"][0]["comment"]["comment_id"] == 100
+    assert document["trees"][0]["children"] == []
+    assert sum(request.url.path == "/x/v2/reply/reply" for request in requests) == 1
+    assert not any(
+        request.url.path in {"/x/v2/reply/wbi/main", "/x/web-interface/nav"} for request in requests
+    )
+
+
+def test_fetch_discussion_paginates_replies_without_repeating_page_one() -> None:
+    page_numbers: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/x/web-interface/view":
+            return api_response(request, view_data())
+        if path == "/x/v2/reply/reply":
+            page_number = int(request.url.params["pn"])
+            page_numbers.append(page_number)
+            if page_number == 1:
+                return api_response(
+                    request,
+                    {
+                        "page": {"num": 1, "size": 2, "count": 3},
+                        "root": raw_comment(100, rcount=3),
+                        "replies": [
+                            raw_comment(110, root=100, parent=100),
+                            raw_comment(111, root=100, parent=110),
+                        ],
+                    },
+                )
+            assert page_number == 2
+            return api_response(
+                request,
+                {
+                    "page": {"num": 2, "size": 20, "count": 3},
+                    "root": raw_comment(100, rcount=3),
+                    "replies": [raw_comment(112, root=100, parent=111)],
+                },
+            )
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    with make_client(handler) as client:
+        result = BilibiliAdapter(client=client, request_delay=0, retries=0).fetch_discussion(
+            share_url(100)
+        )
+
+    document = build_output_document(result)
+    assert page_numbers == [1, 2]
+    assert result.complete is True
+    assert {item.comment_id for item in result.comments} == {100, 110, 111, 112}
+    assert document["conversation_chains"] == [[100, 110, 111, 112]]
+    assert document["stats"]["reply_pages_fetched"] == 2
+
+
+def test_fetch_discussion_root_echo_mismatch_is_incomplete() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/x/web-interface/view":
+            return api_response(request, view_data())
+        if request.url.path == "/x/v2/reply/reply":
+            return api_response(
+                request,
+                {
+                    "page": {"num": 1, "size": 20, "count": 0},
+                    "root": raw_comment(999),
+                    "replies": [],
+                },
+            )
+        raise AssertionError(str(request.url))
+
+    with make_client(handler) as client:
+        result = BilibiliAdapter(client=client, request_delay=0, retries=0).fetch_discussion(
+            share_url(100)
+        )
+
+    document = build_output_document(result)
+    assert result.complete is False
+    assert result.comments == []
+    assert document["trees"] == []
+    mismatch = next(item for item in result.diagnostics if item.category == "root_id_mismatch")
+    assert mismatch.details["requested_root_comment_id"] == 100
+    assert mismatch.details["actual_rpid"] == 999
+
+
+def test_fetch_discussion_missing_root_metadata_is_incomplete() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/x/web-interface/view":
+            return api_response(request, view_data())
+        if request.url.path == "/x/v2/reply/reply":
+            return api_response(
+                request,
+                {"page": {"num": 1, "size": 20, "count": 0}, "replies": []},
+            )
+        raise AssertionError(str(request.url))
+
+    with make_client(handler) as client:
+        result = BilibiliAdapter(client=client, request_delay=0, retries=0).fetch_discussion(
+            share_url(100)
+        )
+
+    assert result.complete is False
+    assert result.comments == []
+    assert any(item.category == "root_metadata_missing" for item in result.diagnostics)
+
+
+@pytest.mark.parametrize("invisible_flag", [True, 1, "true", "TRUE", "1"])
+def test_fetch_discussion_invisible_root_is_incomplete_without_more_pages(
+    invisible_flag: object,
+) -> None:
+    reply_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal reply_calls
+        if request.url.path == "/x/web-interface/view":
+            return api_response(request, view_data())
+        if request.url.path == "/x/v2/reply/reply":
+            reply_calls += 1
+            root_item = raw_comment(100)
+            root_item["invisible"] = invisible_flag
+            return api_response(
+                request,
+                {"page": {"num": 1, "size": 20, "count": 0}, "root": root_item, "replies": []},
+            )
+        raise AssertionError(str(request.url))
+
+    with make_client(handler) as client:
+        result = BilibiliAdapter(client=client, request_delay=0, retries=0).fetch_discussion(
+            share_url(100)
+        )
+
+    assert result.complete is False
+    assert reply_calls == 1
+    assert result.comments == []
+    assert any(item.category == "root_not_visible" for item in result.diagnostics)
+
+
+def test_fetch_discussion_non_root_relationship_is_incomplete() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/x/web-interface/view":
+            return api_response(request, view_data())
+        if request.url.path == "/x/v2/reply/reply":
+            return api_response(
+                request,
+                {
+                    "page": {"num": 1, "size": 20, "count": 0},
+                    "root": raw_comment(100, root=7, parent=7),
+                    "replies": [],
+                },
+            )
+        raise AssertionError(str(request.url))
+
+    with make_client(handler) as client:
+        result = BilibiliAdapter(client=client, request_delay=0, retries=0).fetch_discussion(
+            share_url(100)
+        )
+
+    document = build_output_document(result)
+    assert result.complete is False
+    assert result.comments == []
+    assert document["trees"] == []
+    assert any(item.category == "root_relationship_invalid" for item in result.diagnostics)
+
+
+@pytest.mark.parametrize("api_code", [12006, -404])
+def test_fetch_discussion_api_error_becomes_incomplete_diagnostic(api_code: int) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/x/web-interface/view":
+            return api_response(request, view_data())
+        if request.url.path == "/x/v2/reply/reply":
+            return api_response(request, None, code=api_code)
+        raise AssertionError(str(request.url))
+
+    with make_client(handler) as client:
+        result = BilibiliAdapter(client=client, request_delay=0, retries=0).fetch_discussion(
+            share_url(100)
+        )
+
+    assert result.complete is False
+    assert result.comments == []
+    assert result.discussion is not None
+    diagnostic = next(item for item in result.diagnostics if item.category == "business")
+    assert diagnostic.details["api_code"] == api_code
+
+
+def test_fetch_discussion_focus_never_affects_relationships() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/x/web-interface/view":
+            return api_response(request, view_data())
+        if request.url.path == "/x/v2/reply/reply":
+            return api_response(
+                request,
+                {
+                    "page": {"num": 1, "size": 20, "count": 1},
+                    "root": raw_comment(100, rcount=1),
+                    "replies": [raw_comment(110, root=100, parent=100)],
+                },
+            )
+        raise AssertionError(str(request.url))
+
+    with make_client(handler) as client:
+        result = BilibiliAdapter(client=client, request_delay=0, retries=0).fetch_discussion(
+            share_url(100, focus=999)
+        )
+
+    document = build_output_document(result)
+    assert result.discussion is not None
+    assert result.discussion.focus_comment_id == 999
+    assert result.discussion.root_comment_id == 100
+    assert [item.parent_id for item in result.comments if not item.is_root] == [100]
+    assert document["conversation_chains"] == [[100, 110]]
+
+
+def test_fetch_discussion_page_one_empty_before_count_is_incomplete() -> None:
+    reply_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal reply_calls
+        if request.url.path == "/x/web-interface/view":
+            return api_response(request, view_data())
+        if request.url.path == "/x/v2/reply/reply":
+            reply_calls += 1
+            return api_response(
+                request,
+                {
+                    "page": {"num": 1, "size": 20, "count": 3},
+                    "root": raw_comment(100, rcount=3),
+                    "replies": [],
+                },
+            )
+        raise AssertionError(str(request.url))
+
+    with make_client(handler) as client:
+        result = BilibiliAdapter(client=client, request_delay=0, retries=0).fetch_discussion(
+            share_url(100)
+        )
+
+    assert result.complete is False
+    assert reply_calls == 1
+    assert any(item.category == "pagination_incomplete" for item in result.diagnostics)
+
+
+def test_fetch_reference_b23_comment_link_skips_final_page_request() -> None:
+    requested_hosts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_hosts.append(request.url.host)
+        if request.url.host == "b23.tv":
+            return httpx.Response(
+                302,
+                headers={"Location": f"https://www.bilibili.com/video/{BVID}/?comment_root_id=100"},
+                request=request,
+            )
+        if request.url.path == "/x/web-interface/view":
+            return api_response(request, view_data())
+        if request.url.path == "/x/v2/reply/reply":
+            return api_response(
+                request,
+                {
+                    "page": {"num": 1, "size": 20, "count": 0},
+                    "root": raw_comment(100),
+                    "replies": [],
+                },
+            )
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    with make_client(handler) as client:
+        result = BilibiliAdapter(client=client, request_delay=0, retries=0).fetch_reference(
+            "https://b23.tv/example"
+        )
+
+    assert result.complete is True
+    assert result.discussion is not None
+    assert result.discussion.root_comment_id == 100
+    assert "www.bilibili.com" not in requested_hosts
+    assert requested_hosts.count("b23.tv") == 1
+
+
+def test_fetch_reference_b23_chain_through_second_b23_is_allowed() -> None:
+    requested_hosts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_hosts.append(request.url.host)
+        if request.url.host == "b23.tv" and request.url.path == "/first":
+            return httpx.Response(
+                302, headers={"Location": "https://b23.tv/second"}, request=request
+            )
+        if request.url.host == "b23.tv" and request.url.path == "/second":
+            return httpx.Response(
+                302,
+                headers={"Location": f"https://www.bilibili.com/video/{BVID}/?comment_root_id=100"},
+                request=request,
+            )
+        if request.url.path == "/x/web-interface/view":
+            return api_response(request, view_data())
+        if request.url.path == "/x/v2/reply/reply":
+            return api_response(
+                request,
+                {
+                    "page": {"num": 1, "size": 20, "count": 0},
+                    "root": raw_comment(100),
+                    "replies": [],
+                },
+            )
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    with make_client(handler) as client:
+        result = BilibiliAdapter(client=client, request_delay=0, retries=0).fetch_reference(
+            "https://b23.tv/first"
+        )
+
+    assert result.complete is True
+    assert requested_hosts.count("b23.tv") == 2
+    assert "www.bilibili.com" not in requested_hosts
+
+
+def test_fetch_reference_b23_video_link_falls_back_to_legacy_fetch() -> None:
+    requested_hosts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_hosts.append(request.url.host)
+        if request.url.host == "b23.tv":
+            return httpx.Response(
+                302,
+                headers={"Location": f"https://www.bilibili.com/video/{BVID}"},
+                request=request,
+            )
+        if request.url.path == "/x/web-interface/view":
+            return api_response(request, view_data())
+        if request.url.path == "/x/web-interface/nav":
+            return api_response(request, nav_data(), code=-101)
+        if request.url.path == "/x/v2/reply/wbi/main":
+            return api_response(
+                request,
+                {
+                    "cursor": {"is_end": True, "all_count": 0},
+                    "top_replies": [],
+                    "replies": [],
+                },
+            )
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    with make_client(handler) as client:
+        result = BilibiliAdapter(client=client, request_delay=0, retries=0).fetch_reference(
+            "https://b23.tv/example"
+        )
+
+    assert result.complete is True
+    assert result.discussion is None
+    assert result.video.bvid == BVID
+    assert result.stats.root_pages_fetched == 1
+    assert "www.bilibili.com" not in requested_hosts
+
+
+def test_fetch_reference_expanded_video_url_without_root_falls_back_to_legacy() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/x/web-interface/view":
+            return api_response(request, view_data())
+        if request.url.path == "/x/web-interface/nav":
+            return api_response(request, nav_data(), code=-101)
+        if request.url.path == "/x/v2/reply/wbi/main":
+            return api_response(
+                request,
+                {
+                    "cursor": {"is_end": True, "all_count": 0},
+                    "top_replies": [],
+                    "replies": [],
+                },
+            )
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    with make_client(handler) as client:
+        result = BilibiliAdapter(client=client, request_delay=0, retries=0).fetch_reference(
+            f"https://www.bilibili.com/video/{BVID}"
+        )
+
+    assert result.complete is True
+    assert result.discussion is None
+    assert result.stats.root_pages_fetched == 1
+
+
+def test_b23_redirect_loop_is_rejected_without_unbounded_requests() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(302, headers={"Location": "https://b23.tv/loop"}, request=request)
+
+    with make_client(handler) as client:
+        adapter = BilibiliAdapter(client=client, request_delay=0, retries=0)
+        with pytest.raises(ParameterError, match="循环"):
+            adapter.resolve_video("https://b23.tv/loop")
+
+    assert calls == 1
+
+
+def test_b23_sixth_redirect_hop_is_rejected() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        current = int(request.url.path.rsplit("/", 1)[-1])
+        return httpx.Response(
+            302, headers={"Location": f"https://b23.tv/{current + 1}"}, request=request
+        )
+
+    with make_client(handler) as client:
+        adapter = BilibiliAdapter(client=client, request_delay=0, retries=0)
+        with pytest.raises(ParameterError, match="安全上限"):
+            adapter.resolve_video("https://b23.tv/0")
+
+    assert calls == 5
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "https://",
+        "ftp://bilibili.com/video/BV1xx411c7mD",
+    ],
+)
+def test_b23_malformed_redirect_locations_are_rejected(location: str) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(302, headers={"Location": location}, request=request)
+
+    with make_client(handler) as client:
+        adapter = BilibiliAdapter(client=client, request_delay=0, retries=0)
+        with pytest.raises(ParameterError):
+            adapter.resolve_video("https://b23.tv/example")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        f"https://www.bilibili.com/video/{BVID}/?comment_secondary_id=999",
+        f"https://www.bilibili.com/video/{BVID}/#reply999",
+    ],
+)
+def test_fetch_reference_secondary_or_fragment_without_root_is_fatal_before_requests(
+    url: str,
+) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    with make_client(handler) as client:
+        adapter = BilibiliAdapter(client=client, request_delay=0, retries=0)
+        with pytest.raises(ParameterError):
+            adapter.fetch_reference(url)
+
+    assert calls == 0
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        f"https://www.bilibili.com/video/{BVID}/?COMMENT_ROOT_ID=100",
+        f"https://www.bilibili.com/video/{BVID}/?Comment_Secondary_Id=999",
+        f"https://www.bilibili.com/video/{BVID}/#Reply999",
+    ],
+)
+def test_fetch_reference_case_variant_markers_fail_closed_without_requests(url: str) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    with make_client(handler) as client:
+        adapter = BilibiliAdapter(client=client, request_delay=0, retries=0)
+        with pytest.raises(ParameterError):
+            adapter.fetch_reference(url)
+
+    assert calls == 0
+
+
+def test_fetch_reference_b23_original_marker_lost_in_location_is_fatal() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if request.url.host == "b23.tv":
+            return httpx.Response(
+                302,
+                headers={"Location": f"https://www.bilibili.com/video/{BVID}"},
+                request=request,
+            )
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    with make_client(handler) as client:
+        adapter = BilibiliAdapter(client=client, request_delay=0, retries=0)
+        with pytest.raises(ParameterError, match="comment_root_id"):
+            adapter.fetch_reference("https://b23.tv/example?comment_root_id=100")
+
+    assert calls == 1
+
+
+def test_video_reference_extracts_only_path_identifiers() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/x/web-interface/view"
+        assert request.url.params.get("aid") == "42"
+        assert "bvid" not in request.url.params
+        return api_response(request, view_data())
+
+    with make_client(handler) as client:
+        video = BilibiliAdapter(client=client, request_delay=0, retries=0).resolve_video(
+            f"https://www.bilibili.com/video/av42?bvid={BVID}"
+        )
+
+    assert video.bvid == BVID
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "ftp://b23.tv/example",
+        "https://user:pass@b23.tv/example",
+        "https://b23.tv:8080/example",
+        "https://b23.tv:abc/example",
+    ],
+)
+def test_b23_initial_authority_violations_rejected_before_requests(url: str) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    with make_client(handler) as client:
+        adapter = BilibiliAdapter(client=client, request_delay=0, retries=0)
+        with pytest.raises(ParameterError):
+            adapter.resolve_video(url)
+
+    assert calls == 0
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "ftp://b23.tv/next",
+        "https://user:pass@b23.tv/next",
+        "https://b23.tv:8080/next",
+    ],
+)
+def test_b23_hop_authority_violations_rejected_after_first_request(location: str) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(302, headers={"Location": location}, request=request)
+
+    with make_client(handler) as client:
+        adapter = BilibiliAdapter(client=client, request_delay=0, retries=0)
+        with pytest.raises(ParameterError):
+            adapter.resolve_video("https://b23.tv/example")
+
+    assert calls == 1
+
+
+def test_b23_remote_protocol_error_is_parameter_error() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(302, headers={"Location": "https://b23.tv:bad/next"}, request=request)
+
+    with make_client(handler) as client:
+        adapter = BilibiliAdapter(client=client, request_delay=0, retries=0)
+        with pytest.raises(ParameterError, match="协议畸形"):
+            adapter.resolve_video("https://b23.tv/example")
+
+    assert calls == 1
+
+
+@pytest.mark.parametrize(
+    "initial_url",
+    [
+        "http://b23.tv:80/example",
+        "https://b23.tv:443/example",
+    ],
+)
+def test_b23_default_ports_are_accepted(initial_url: str) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "b23.tv":
+            return httpx.Response(
+                302,
+                headers={"Location": f"https://www.bilibili.com/video/{BVID}"},
+                request=request,
+            )
+        if request.url.path == "/x/web-interface/view":
+            return api_response(request, view_data())
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    with make_client(handler) as client:
+        video = BilibiliAdapter(client=client, request_delay=0, retries=0).resolve_video(
+            initial_url
+        )
+
+    assert video.bvid == BVID
+
+
+@pytest.mark.parametrize(
+    ("reference", "expected_key", "expected_value"),
+    [
+        ("BV1xx411c7mD", "bvid", "BV1xx411c7mD"),
+        ("av42", "aid", "42"),
+        ("42", "aid", "42"),
+    ],
+)
+def test_fetch_reference_bare_references_dispatch_to_legacy(
+    reference: str,
+    expected_key: str,
+    expected_value: str,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/x/web-interface/view":
+            assert request.url.params.get(expected_key) == expected_value
+            return api_response(request, view_data())
+        if request.url.path == "/x/web-interface/nav":
+            return api_response(request, nav_data(), code=-101)
+        if request.url.path == "/x/v2/reply/wbi/main":
+            return api_response(
+                request,
+                {
+                    "cursor": {"is_end": True, "all_count": 0},
+                    "top_replies": [],
+                    "replies": [],
+                },
+            )
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    with make_client(handler) as client:
+        result = BilibiliAdapter(client=client, request_delay=0, retries=0).fetch_reference(
+            reference
+        )
+
+    assert result.complete is True
+    assert result.discussion is None
+    assert result.stats.root_pages_fetched == 1
+
+
+def test_fetch_discussion_wrong_root_excludes_foreign_replies() -> None:
+    reply_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal reply_calls
+        if request.url.path == "/x/web-interface/view":
+            return api_response(request, view_data())
+        if request.url.path == "/x/v2/reply/reply":
+            reply_calls += 1
+            return api_response(
+                request,
+                {
+                    "page": {"num": 1, "size": 20, "count": 2},
+                    "root": raw_comment(999, rcount=2),
+                    "replies": [
+                        raw_comment(910, root=999, parent=999),
+                        raw_comment(911, root=999, parent=910),
+                    ],
+                },
+            )
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    with make_client(handler) as client:
+        result = BilibiliAdapter(client=client, request_delay=0, retries=0).fetch_discussion(
+            share_url(100)
+        )
+
+    document = build_output_document(result)
+    assert result.complete is False
+    assert reply_calls == 1
+    assert result.comments == []
+    assert document["trees"] == []
+    assert document["orphan_comment_ids"] == []
+    assert any(item.category == "root_id_mismatch" for item in result.diagnostics)
+    excluded = next(
+        item for item in result.diagnostics if item.category == "foreign_root_reply_excluded"
+    )
+    assert excluded.details["excluded_count"] == 2
+    assert excluded.details["excluded_root_ids"] == [999]
+
+
+@pytest.mark.parametrize(
+    "root_payload",
+    [
+        pytest.param(None, id="missing"),
+        pytest.param(True, id="invisible"),
+        pytest.param(999, id="wrong-id"),
+    ],
+)
+def test_fetch_discussion_invalid_root_keeps_requested_replies_as_orphans(
+    root_payload: int | bool | None,
+) -> None:
+    reply_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal reply_calls
+        if request.url.path == "/x/web-interface/view":
+            return api_response(request, view_data())
+        if request.url.path == "/x/v2/reply/reply":
+            reply_calls += 1
+            data: dict[str, Any] = {
+                "page": {"num": 1, "size": 20, "count": 1},
+                "replies": [raw_comment(110, root=100, parent=100)],
+            }
+            if root_payload is None:
+                return api_response(request, data)
+            if root_payload is True:
+                root_item = raw_comment(100)
+                root_item["invisible"] = True
+                data["root"] = root_item
+                return api_response(request, data)
+            data["root"] = raw_comment(root_payload)
+            return api_response(request, data)
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    with make_client(handler) as client:
+        result = BilibiliAdapter(client=client, request_delay=0, retries=0).fetch_discussion(
+            share_url(100)
+        )
+
+    document = build_output_document(result)
+    assert result.complete is False
+    assert reply_calls == 1
+    assert [item.comment_id for item in result.comments] == [110]
+    assert document["trees"] == []
+    assert document["orphan_comment_ids"] == [110]
+    assert not any(item.category == "foreign_root_reply_excluded" for item in result.diagnostics)
+
+
+def test_fetch_discussion_valid_root_parses_page_one_replies_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reply_scopes: list[str] = []
+    original_parse_comment = BilibiliAdapter._parse_comment
+
+    def counting_parse_comment(
+        self: BilibiliAdapter,
+        raw_item: Any,
+        *,
+        video_id: str,
+        scope: str,
+        diagnostics: list[Any],
+    ) -> Any:
+        if "reply_page" in scope:
+            reply_scopes.append(scope)
+        return original_parse_comment(
+            self,
+            raw_item,
+            video_id=video_id,
+            scope=scope,
+            diagnostics=diagnostics,
+        )
+
+    monkeypatch.setattr(BilibiliAdapter, "_parse_comment", counting_parse_comment)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/x/web-interface/view":
+            return api_response(request, view_data())
+        if request.url.path == "/x/v2/reply/reply":
+            assert request.url.params["pn"] == "1"
+            return api_response(
+                request,
+                {
+                    "page": {"num": 1, "size": 20, "count": 2},
+                    "root": raw_comment(100, rcount=2),
+                    "replies": [
+                        raw_comment(110, root=100, parent=100),
+                        raw_comment(111, root=100, parent=110),
+                    ],
+                },
+            )
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    with make_client(handler) as client:
+        result = BilibiliAdapter(client=client, request_delay=0, retries=0).fetch_discussion(
+            share_url(100)
+        )
+
+    assert result.complete is True
+    assert {item.comment_id for item in result.comments} == {100, 110, 111}
+    assert reply_scopes == [
+        "root:100:reply_page:1",
+        "root:100:reply_page:1",
+    ]
