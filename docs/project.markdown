@@ -10,6 +10,8 @@
 
 M2（本地进程内认证 session 与 viewer 身份）已完成：提供 Cookie 时程序在进程内建立认证 session，并在评论读取前用一次 nav 确认当前 viewer（与 legacy WBI 共用缓存）；无凭证时使用显式 anonymous viewer 且不因身份请求 nav。凭证只在进程内存在，匿名与登录视角在输出中明确可区分，`is_self` 由输出层按 viewer 派生。
 
+M3（SQLite 持久化与同步语义）已完成：显式 `--database PATH` 把用户主动选择的定向讨论原子落库——按 viewer 与 discussion 维护规范化评论事实、ever-seen、完整同步基线、可见性差集与追加式 sync run 账本；未提供该参数时行为不变。通知事件、LLM/MCP 上下文与写接口（M4+ 目标）仍不在当前代码中。
+
 - 不做整段视频/整站评论数据采集，不做数据训练，不做长期用户画像系统。
 - 只处理**少量、用户主动选择**的讨论：一条根评论及其当前可见的楼中楼回复。
 - 核心价值是让大模型看见“完整可见的当前讨论”——话题是什么、每个参与者在这条讨论里说过什么、哪些是新增或当前不可见（可见性变化）——从而按需推断参与者意图、立场与互动关系，并生成**待确认的回复草稿**。
@@ -21,7 +23,7 @@ M2（本地进程内认证 session 与 viewer 身份）已完成：提供 Cookie
 ## 核心用户旅程
 
 1. 用户在手机 B 站分享一条评论，复制链接（b23.tv 短链或展开后的 URL）。**（当前 MVP 已可用）**
-2. 工具打开并同步这条根讨论：当前可见的根评论与全部楼中楼回复；入口可指向根评论或楼中楼，焦点归约到根楼层。同步按当前 session 的 viewer 视角执行（匿名显式、登录经一次 nav 确认）。**（当前 MVP 已可用）**
+2. 工具打开并同步这条根讨论：当前可见的根评论与全部楼中楼回复；入口可指向根评论或楼中楼，焦点归约到根楼层。同步按当前 session 的 viewer 视角执行（匿名显式、登录经一次 nav 确认）；提供 `--database PATH` 时该轮同步作为原子 sync run 持久化（仅选中讨论）。**（当前 MVP 已可用）**
 3. 用户说“有人在评论区回复了我”时，工具读取当前账号的“回复我的”通知，定位受影响讨论并重新同步。**（planned）**
 4. 大模型获得完整上下文（含参与者证据汇总与可见性差异），推断意图/立场/关系并生成草稿。**（planned）**
 5. 用户确认后，工具只发送这一条回复；全部过程可审计。**（planned）**
@@ -32,8 +34,8 @@ M2（本地进程内认证 session 与 viewer 身份）已完成：提供 Cookie
 
 ```text
 用户选择讨论（手机分享链接）
-  → 定向同步该根讨论的当前可见内容
-  → 本地持久化（仅选中讨论）
+  → 定向同步该根讨论的当前可见内容（当前 MVP）
+  → 本地持久化（仅选中讨论；`--database`，当前 MVP）
   → 通知发现“有人回复我”
   → 为 LLM 提供完整可见上下文
   → 生成草稿
@@ -43,7 +45,7 @@ M2（本地进程内认证 session 与 viewer 身份）已完成：提供 Cookie
 
 这条链路是目标方向；实现顺序与验收见 [roadmap.markdown](roadmap.markdown)，不是实施授权。
 
-其中“用户选择讨论 → 定向同步该根讨论的当前可见内容（含本地认证 session 与 viewer 身份）”已是当前 MVP 可用能力；其余环节为 M3+ 目标。
+其中“用户选择讨论 → 定向同步该根讨论的当前可见内容（含本地认证 session 与 viewer 身份）→ 本地持久化（仅选中讨论，显式 `--database`）”已是当前 MVP 可用能力；其余环节为 M4+ 目标。
 
 ## 常青原则
 
@@ -63,9 +65,9 @@ M2（本地进程内认证 session 与 viewer 身份）已完成：提供 Cookie
 
 ## 当前状态（简洁指针）
 
-当前可运行代码：当前 MVP（roadmap 的 M1：讨论定向读取 + M2：本地认证 session/viewer 身份）已完成——评论分享链接 → 归约根楼层 → 读该根评论与楼层内当前可见回复，并按当前 viewer 视角输出（匿名显式、登录经一次 nav 确认，失败 exit 1）；legacy 整视频只读基线（旧 MVP）保留为诊断兼容。**没有** SQLite、通知事件、LLM/MCP 上下文或回复写接口（均为 M3+ 目标）；也没有跨运行的认证持久化（无 `auth.json`），认证 session 只存在于进程内。
+当前可运行代码：当前 MVP（roadmap 的 M1：讨论定向读取 + M2：本地认证 session/viewer 身份 + M3：SQLite 持久化同步）已完成——评论分享链接 → 归约根楼层 → 读该根评论与楼层内当前可见回复，并按当前 viewer 视角输出（匿名显式、登录经一次 nav 确认，失败 exit 1）；提供 `--database PATH` 时把该轮定向同步原子写入本地 SQLite（schema v1：viewers/discussions/comments/viewer_state/comment_observation/sync_runs，以及 M4/M6 的存储基础表），按 `(viewer, discussion)` 维护 ever-seen、last-complete baseline 与可见性差集，`complete=false` 只吸收新观察；legacy 整视频只读基线（旧 MVP）保留为诊断兼容。没有默认数据库路径或数据库查询 CLI，也不迁移旧 `comments.json`；通知事件、LLM/MCP 上下文或回复写接口（均为 M4+ 目标）仍未实现；认证 session 仍是进程内一次性状态（无 `auth.json`），SQLite 不持久化凭证。
 
-验证边界：登录态只由脱敏离线 fixture 验证，未使用真实私人账号 smoke；2026-08-16 只对匿名 nav 做过真实只读核验（`code=-101`、`isLogin=false`、`mid=null`、`uname=null` 且仍有 WBI 数据）。
+验证边界：登录态只由脱敏离线 fixture 验证，未使用真实私人账号 smoke；2026-08-16 只对匿名 nav 做过真实只读核验（`code=-101`、`isLogin=false`、`mid=null`、`uname=null` 且仍有 WBI 数据）。M3 持久化路径全部由离线自动化测试验证（本次主工作区实测：210 passed、覆盖率 87%、ruff format/check 通过），未对 `--database` 做过真实网络 smoke。
 
 - 当前实现架构（当前项目画像）：见 [architecture.markdown](architecture.markdown)，全文描述当前代码事实。
 - 依赖顺序与里程碑：见 [roadmap.markdown](roadmap.markdown)。

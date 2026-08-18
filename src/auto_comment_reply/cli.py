@@ -13,6 +13,7 @@ from pathlib import Path
 from .adapter import BilibiliAdapter
 from .errors import BilibiliError
 from .output import build_output_document
+from .sync import PersistenceError, persist_discussion_sync
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -42,6 +43,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="从本机私有文件读取 Cookie；未指定时读取 BILIBILI_COOKIE 环境变量",
     )
     parser.add_argument("--force", action="store_true", help="允许覆盖已存在的输出文件")
+    parser.add_argument(
+        "--database",
+        type=Path,
+        metavar="PATH",
+        help=("本地 SQLite 数据库路径；仅评论分享链接的定向讨论支持持久化，legacy 全量读取不支持"),
+    )
     parser.add_argument("--compact", action="store_true", help="输出紧凑 JSON")
     parser.add_argument("--timeout", type=float, default=15.0, help="单次请求超时秒数（默认 15）")
     parser.add_argument(
@@ -142,7 +149,17 @@ def main(argv: list[str] | None = None) -> int:
         ) as adapter:
             result = adapter.fetch_reference(args.reference)
 
+        if args.database is not None and result.discussion is None:
+            logging.error(
+                "legacy 全量读取不支持 --database 持久化；仅评论分享链接的定向讨论支持数据库同步。"
+            )
+            return 1
+
         document = build_output_document(result)
+
+        if args.database is not None:
+            persist_discussion_sync(args.database, result, document)
+
         indent = None if args.compact else 2
         content = json.dumps(document, ensure_ascii=False, indent=indent) + "\n"
 
@@ -163,7 +180,7 @@ def main(argv: list[str] | None = None) -> int:
 
         logging.error("读取结果不完整；请查看 JSON 中的 diagnostics。")
         return 2
-    except (BilibiliError, ValueError, OSError) as error:
+    except (BilibiliError, ValueError, OSError, PersistenceError) as error:
         logging.error("%s", error)
         return 1
 

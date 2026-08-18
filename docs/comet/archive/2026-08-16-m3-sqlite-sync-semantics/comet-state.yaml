@@ -1,0 +1,1326 @@
+schema: comet.native.v4
+name: m3-sqlite-sync-semantics
+language: zh-CN
+phase: archive
+status: done
+state_version: 7
+brief: brief.md
+spec_changes:
+  - capability: sqlite-persistent-sync
+    operation: create
+    source: specs/sqlite-persistent-sync/spec.md
+workspace:
+  isolation: current
+  change_branch: main
+  target_branch: main
+  finish: null
+loop:
+  stage: done
+  goal_cycle: 1
+  iteration: 1
+  attempt: 1
+  retry_epoch: 0
+  failed_iteration_count: 0
+  no_progress_count: 0
+  execution_failure_count: 0
+  previous_unresolved_ids: []
+  next_action: null
+acceptance:
+  - id: A1
+    source: brief.md
+    text: A1：schema 与事务约束生效；discussion 自然键和 `(discussion_id, platform_comment_id)`
+      comment 唯一键不会产生重复实体，同一同步中的 comments、observations、sync_run 与 baseline
+      要么全部提交，要么全部回滚。
+    result: passed
+    reason:
+      text: storage.py schema DDL enforces discussions
+        UNIQUE(platform,object_type,oid,root_comment_id) (line 284) and comments
+        UNIQUE(discussion_id,comment_id) (line 302); the entire run executes
+        inside one _write_transaction BEGIN IMMEDIATE..COMMIT (lines 569-613);
+        test_identical_snapshot_is_idempotent proves no duplicate entities and
+        test_fault_before_commit_rolls_back_entire_run proves all-or-nothing.
+      truncated: false
+  - id: A2
+    source: brief.md
+    text: A2：在事务中途注入异常并重新打开数据库后，上一轮已提交 baseline 保持完整，数据库可继续同步，失败候选不留下半份运行或可见性差集。
+    result: passed
+    reason:
+      text: "storage.inject_fault('before_commit') is used in
+        test_fault_before_commit_rolls_back_entire_run: injected RuntimeError
+        surfaces as PersistenceError, reopening via the query API shows the
+        prior baseline [100], exactly one run and one comment, and the next sync
+        succeeds with newly_observed (110,)."
+      truncated: false
+  - id: A3
+    source: brief.md
+    text: A3：同一 viewer 的连续完整同步正确计算 `newly_observed = observed_ids -
+      ever_seen_before`，把 `previous_visible_ids - observed_ids` 仅标为
+      `not_currently_visible`，并把 last complete baseline 更新为本轮 observed_ids。
+    result: passed
+    reason:
+      text: sync.py reads ever_seen_before (lines 164-167), computes newly_observed =
+        observed - ever_seen (167), diff = previous_visible - observed (213),
+        then replaces baseline via _update_viewer_state (247-255);
+        test_complete_runs_compute_newly_observed_and_visibility_diff asserts
+        newly (120,), diff (110,), baseline [100,120] and per-comment visibility
+        labels.
+      truncated: false
+  - id: A4
+    source: brief.md
+    text: A4：`complete=false` 时，新观察仍并入 ever_seen 且 diagnostics/sync_run 可审计，但不替换
+      last complete baseline、不计算缺失差集、不写任何删除或当前不可见推断。
+    result: passed
+    reason:
+      text: complete=false branch sets previous_visible_ids=None (line 200) and
+        not_currently_visible_ids=() (line 225), and _update_viewer_state only
+        touches updated_at (lines 1069-1072);
+        test_incomplete_run_absorbs_observations_without_baseline_change shows
+        baseline stays [100], ever_seen grows to [100,200], new comment 200 has
+        NULL visibility and the appended run is complete=False.
+      truncated: false
+  - id: A5
+    source: brief.md
+    text: A5：完整且 observed_ids 为空时，新 baseline 为空，上一完整 baseline 的评论均转为
+      `not_currently_visible`；这仍不证明永久删除。
+    result: passed
+    reason:
+      text: test_empty_complete_run_clears_baseline_conservatively proves an empty
+        complete run writes an empty baseline and marks the prior comment
+        not_currently_visible; the label and docs state this is visibility only,
+        not permanent deletion.
+      truncated: false
+  - id: A6
+    source: brief.md
+    text: A6：同一 viewer 对同一无变化快照重复完整同步时，第二轮 newly_observed 和 visibility diff 为空，实体与
+      observation 不重复，追加的 sync_run 仍可审计。
+    result: passed
+    reason:
+      text: "test_identical_snapshot_is_idempotent: second complete run has empty
+        newly_observed and diff, table counts stay
+        comments=2/observation=2/viewer_state=1, and list_sync_runs returns two
+        append-only runs."
+      truncated: false
+  - id: A7
+    source: brief.md
+    text: A7：同一 discussion 的不同 viewer 具有独立 state、baseline 与 comment
+      observations；username 展示值变化不改变 viewer 稳定身份。
+    result: passed
+    reason:
+      text: viewer_state PK (discussion_id,viewer_id) (line 340) and
+        comment_observation PK includes viewer_id (line 354); _upsert_viewer
+        matches (platform,platform_user_id) and only refreshes username (lines
+        700-727); test_viewers_are_isolated_and_username_change_keeps_identity
+        uses alice then bob with the same mid and asserts one authenticated
+        viewer row plus anonymous state stays None.
+      truncated: false
+  - id: A8
+    source: brief.md
+    text: A8：`comment_observation.current_visibility` 在尚无完整 baseline 可作结论时为空；非空值只允许
+      `visible / not_currently_visible`。`unavailable` 只允许作为
+      `reply_event.target_availability`，并与事件状态正交。
+    result: passed
+    reason:
+      text: comment_observation.current_visibility is nullable with CHECK IN
+        ('visible','not_currently_visible') (lines 352-353) and NULL is written
+        for runs without a complete baseline (sync lines 202-210);
+        reply_events.target_availability CHECK IN
+        ('unknown','available','unavailable') (lines 389-390) is a separate
+        column from event_status (391-392); tests
+        test_observation_visibility_check_rejects_unavailable and
+        test_reply_event_target_availability_is_independent_of_status cover
+        both.
+      truncated: false
+  - id: A9
+    source: brief.md
+    text: A9：comments 保存规范化关系、作者、内容与展示事实，不保存 `is_self`、单一全局 visibility 或
+      Cookie/CSRF/平台请求线协议字段；平台 comment ID 无截断或精度损失。
+    result: passed
+    reason:
+      text: comments table stores only normalized
+        comment_id/author_id/username/content/root_id/parent_id/created_at/video_id/reply_count
+        (lines 288-304); test_comments_store_no_is_self_or_global_visibility
+        confirms no is_self/visibility/user_id columns, and
+        test_large_int64_ids_round_trip_without_precision_loss uses 2^53+1 and
+        int64 max with INTEGER storage and int-typed API output.
+      truncated: false
+  - id: A10
+    source: brief.md
+    text: A10：至少两个跨小时同步的 discussions 可按 viewer/discussion 稳定查询各自 sync runs、ever
+      seen、last complete 与 current observation；查询结果不串 viewer 或 discussion。
+    result: passed
+    reason:
+      text: test_query_api_is_viewer_scoped_and_stably_ordered monkeypatches _now_utc
+        to tick across hours and syncs two discussions for two viewers; it
+        asserts per-viewer discussion lists ([100] vs [200]), run observed_ids
+        per scope, finished_at ordering, and the query ORDER BY clauses use
+        persistent time plus internal stable keys (storage lines 1116, 1211,
+        1254, 1282).
+      truncated: false
+  - id: A11
+    source: brief.md
+    text: A11：旧 `comments.json`
+      不被自动发现或迁移，唯一测试凭证不出现在数据库、stdout、文件、stderr、异常、diagnostics、Runtime handoff
+      或报告。
+    result: passed
+    reason:
+      text: no src code path reads or migrates comments.json (grep shows only
+        docs/tests mention it, and comments*.json is gitignored);
+        test_credentials_never_persist_to_database_bytes asserts the unique fake
+        secret is absent from DB bytes, CLI leak tests cover stdout/file/stderr,
+        and the M3 Runtime handoff/state contain no credential text.
+      truncated: false
+  - id: A12
+    source: brief.md
+    text: A12：未启用持久化时，现有定向 schema 1.2、legacy schema 1.0、输出文件覆盖保护、请求范围及 CLI exit
+      0/1/2 不回归；全量离线测试、ruff format/check 与覆盖率检查通过。
+    result: passed
+    reason:
+      text: cli.py skips persistence entirely without --database (line 160);
+        test_cli_without_database_never_calls_persistence asserts legacy schema
+        1.0, no persistence call even with a BILIBILI_DB env decoy, and no DB
+        file; existing exit 0/1/2 and overwrite-protection tests still pass;
+        Runtime checks (ruff format/lint, 210 passed, 87% coverage) passed.
+      truncated: false
+  - id: A13
+    source: brief.md
+    text: A13：启用持久化时，成功或远端 `complete=false` 的同步仍输出不扩展字段的 schema 1.2 并分别返回 exit
+      0/2；legacy reference + `--database` 在持久化前 exit 1 且无 JSON/DB 写入；SQLite
+      打开、schema、锁定、约束或 commit 失败时整单元回滚、exit 1 且无 JSON。
+    result: passed
+    reason:
+      text: test_cli_database_enabled_persists_final_document_before_write asserts
+        event order fetch->build->persist->dump->write and schema 1.2 without
+        database/sync-run/baseline/diff fields;
+        test_cli_incomplete_result_with_database_writes_schema_1_2_and_returns_two
+        (exit 2);
+        test_cli_legacy_reference_with_database_exits_one_before_persist (no
+        JSON/DB);
+        test_cli_database_persistence_error_exits_one_without_json_or_file plus
+        storage-level open/schema/lock/constraint/commit tests prove rollback +
+        exit 1 + no JSON.
+      truncated: false
+  - id: A14
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 系统可以把用户主动选择的定向讨论同步到显式指定的本地 SQLite 数据库。数据库保存规范化讨论事实、viewer-relative 观察、完整同步
+      baseline 和追加式 sync run
+      ledger，使同一讨论能够跨进程、跨小时重复同步，并以保守语义回答“本轮首次观察到什么”和“相对上一完整同步，什么当前不可见”。
+    result: passed
+    reason:
+      text: "The capability exists end-to-end: --database routes targeted results
+        through persist_discussion_sync into a reopened-able SQLite file
+        containing normalized discussions/comments, viewer-scoped observations,
+        viewer_state baseline and append-only sync_runs; repeated cross-hour
+        runs answer newly-observed and not-currently-visible through the query
+        API (covered by test_sync/test_storage suites)."
+      truncated: false
+  - id: A15
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 本能力只陈述观察事实。`not_currently_visible` 不证明永久删除、屏蔽原因或全局不可用；只有同一 viewer 的最终
+      `complete=true` 同步可以推进当前可见性 baseline。不完整同步可以吸收新观察，但不能依据缺失项作负面推断。
+    result: passed
+    reason:
+      text: sync writes only visible/not_currently_visible, derives
+        not_currently_visible solely from previous_visible - observed, and the
+        incomplete branch performs no negative inference;
+        README/architecture/project documents that not_currently_visible is not
+        deletion proof and only a same-viewer complete=true run advances the
+        baseline.
+      truncated: false
+  - id: A16
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 现有 `auto-comment-reply <reference>` 命令新增可选 `--database PATH`。只有提供该参数且
+      reference 解析为用户选中的定向 discussion 时才启用 SQLite 持久化。
+    result: passed
+    reason:
+      text: cli.py adds optional --database PATH (lines 46-51), gates persistence on
+        result.discussion being non-None (152-156), and persist_discussion_sync
+        independently raises unsupported_discussion for legacy results
+        (144-145).
+      truncated: false
+  - id: A17
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 未提供 `--database` 时，网络请求、定向 schema 1.2、legacy schema
+      1.0、stdout/文件输出、`--force` 覆盖保护和 exit 0/1/2 语义保持现状。
+    result: passed
+    reason:
+      text: Without --database no module touches SQLite (cli line 160 and
+        test_cli_without_database_never_calls_persistence); network, schema
+        1.2/1.0, stdout/file, --force protection and exit 0/1/2 tests are
+        unchanged and the full 210-test suite passes.
+      truncated: false
+  - id: A18
+    source: specs/sqlite-persistent-sync/spec.md
+    text: "`--database` 不建立默认路径、不读取环境变量数据库路径、不自动发现数据库，也不在应用数据目录产生隐藏状态。"
+    result: passed
+    reason:
+      text: --database defaults to None, no environment variable is read for a DB path
+        (only BILIBILI_COOKIE at cli line 85), no auto-discovery or app-data
+        writes exist; test_cli_without_database_never_calls_persistence sets
+        BILIBILI_DB and asserts it is never created or used.
+      truncated: false
+  - id: A19
+    source: specs/sqlite-persistent-sync/spec.md
+    text: legacy 整视频诊断 reference 与 `--database` 组合必须在持久化前被拒绝，CLI exit 1 且不产生 JSON；M3
+      不把整视频读取变成产品数据管道。
+    result: passed
+    reason:
+      text: cli.py rejects legacy results with --database before
+        build_output_document/persist (152-156) returning 1;
+        test_cli_legacy_reference_with_database_exits_one_before_persist asserts
+        no persist call, empty stdout, no output file and no database file.
+      truncated: false
+  - id: A20
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 第一次成功提交某个 `(viewer, discussion)` 的数据库事务时，系统自动建立其 bound/tracked state，与该
+      run 的 `complete` 无关；M3 不增加单独的 track/untrack 命令。
+    result: passed
+    reason:
+      text: _ensure_viewer_state runs unconditionally before any complete check (sync
+        161-163);
+        test_persisted_complete_diagnostics_and_generated_at_come_from_document
+        persists a first run with complete=False and still gets a tracked state
+        (last_complete_visible_ids None); no track/untrack command exists.
+      truncated: false
+  - id: A21
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 定向 JSON 输出保持 schema 1.2，不加入数据库路径、内部主键、sync_run id、baseline 或 diff
+      字段。SQLite 状态由 Python storage/query API 提供给后续能力；M3 不增加最终用户数据库查询 CLI。
+    result: passed
+    reason:
+      text: build_output_document keeps schema 1.2 and sync mutates only
+        complete/diagnostics in place;
+        test_cli_database_enabled_persists_final_document_before_write asserts
+        the forbidden key set
+        {sync_run_id,sync_run,baseline,diff,newly_observed,not_currently_visible,database,database_path}
+        is absent and the DB path does not appear in output; build_parser adds
+        no query subcommand.
+      truncated: false
+  - id: A22
+    source: specs/sqlite-persistent-sync/spec.md
+    text: SQLite 位于 Adapter 之外。Adapter 继续只负责引用解析、viewer 解析、平台请求、分页、规范化 comment facts
+      与 diagnostics；不得接收连接、执行 SQL 或持久化平台抓取游标。
+    result: passed
+    reason:
+      text: adapter.py imports only models/reference/wbi/errors/httpx (grep shows no
+        storage/sync/sqlite) and emits credential-free FetchResult with
+        discussion/viewer/comments; it receives no connection, executes no SQL
+        and persists no pagination cursor.
+      truncated: false
+  - id: A23
+    source: specs/sqlite-persistent-sync/spec.md
+    text: storage 层负责连接、schema version、迁移、约束、索引、事务和查询；sync 层负责把一次已经完成结构校验的定向
+      `FetchResult` 应用为一个原子 sync run。
+    result: passed
+    reason:
+      text: storage.py owns
+        connection/PRAGMA/schema-version/migrations/constraints/indexes/_write_transaction
+        and the query functions (module docstring and lines 209-549); sync.py
+        applies one structurally finalized FetchResult plus final document as a
+        single atomic run.
+      truncated: false
+  - id: A24
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 使用 Python 标准库 `sqlite3`，不引入 ORM。数据库必须有显式 schema
+      version，并只执行已知、单调、事务化的迁移；遇到比当前程序更新或无法识别的 schema 必须 fail
+      closed，不得猜测、降级或破坏数据。
+    result: passed
+    reason:
+      text: pyproject dependencies contain only httpx (stdlib sqlite3, no ORM);
+        SCHEMA_VERSION=1 (line 41); _validate_schema_version raises
+        schema_too_new for newer versions (526-527) and schema_unknown for
+        unrecognized structures; _migrate_schema executes only known steps in
+        per-step transactions (505-519); test_future_schema_version_fails_closed
+        covers fail-closed reads and writes.
+      truncated: false
+  - id: A25
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 平台 ID 必须无截断、无浮点转换和无精度损失。SQLite 物理列型可由实现决定，但 API 对外保持规范化的完整 ID 值。
+    result: passed
+    reason:
+      text: comment_id/author_id/root_id/parent_id/oid/aid are SQLite INTEGER columns
+        and query API returns Python ints;
+        test_large_int64_ids_round_trip_without_precision_loss round-trips
+        9_007_199_254_740_993 and int64 max exactly.
+      truncated: false
+  - id: A26
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 所有持久化时间使用 UTC，并以稳定、可排序的格式或整数表示；跨时区查询不得改变顺序或身份。
+    result: passed
+    reason:
+      text: _now_utc returns UTC and _format_utc emits fixed-width sortable
+        'YYYY-MM-DDTHH:MM:SS.ffffffZ' (lines 97-106); comment platform time is
+        stored as integer epoch; runs/state use the fixed UTC text and stable
+        ORDER BY (finished_at,id etc.).
+      truncated: false
+  - id: A27
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 数据库包含 viewer mid、展示用户名和评论正文，属于本地私有产品数据。Cookie、CSRF、request
+      headers、认证文件内容和其他凭证永不进入数据库、SQL 参数日志、异常或 diagnostics。
+    result: passed
+    reason:
+      text: schema stores only normalized viewer mid/username/comment content facts
+        and has no cookie/CSRF/header columns;
+        test_credentials_never_persist_to_database_bytes asserts the unique fake
+        secret is absent from the DB file bytes, and diagnostics originate from
+        the already-sanitized adapter/output boundaries.
+      truncated: false
+  - id: A28
+    source: specs/sqlite-persistent-sync/spec.md
+    text: viewer 的稳定已认证身份是 `(platform, platform_user_id)`；Bilibili
+      `platform_user_id` 是 nav 确认的正整数 mid。username
+      仅为可更新的展示字段，不参与身份、授权、discussion identity 或 baseline key。
+    result: passed
+    reason:
+      text: Viewer.identity is (platform, authenticated, platform_user_id) excluding
+        username (models 79-90); _upsert_viewer looks up by platform+mid and
+        only updates username (704-727); M2 _parse_viewer enforces
+        positive-integer mid; test alice/bob with the same mid keeps one viewer
+        row.
+      truncated: false
+  - id: A29
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 每个数据库中，每个平台恰有一个稳定 anonymous viewer。其
+      `authenticated=false`、`platform_user_id=null`、`username=null`；重复 anonymous
+      同步必须解析到同一内部 viewer id，不能受 SQLite `NULL != NULL` 的唯一性行为影响而生成重复实体。
+    result: passed
+    reason:
+      text: partial unique index uq_viewers_anonymous ON viewers(platform) WHERE
+        authenticated=0 (line 267) avoids NULL!=NULL duplication, and anonymous
+        lookup/upsert selects by platform+authenticated=0 (642-649, 729-734);
+        test_anonymous_viewer_is_one_stable_entity_per_platform asserts a single
+        anonymous row after repeated syncs.
+      truncated: false
+  - id: A30
+    source: specs/sqlite-persistent-sync/spec.md
+    text: anonymous viewer 与任意 authenticated viewer 完全隔离。同一 discussion 在不同 viewer
+      下有不同的 discussion_viewer_state、ever-seen、last-complete baseline、comment
+      observations 与 sync runs。
+    result: passed
+    reason:
+      text: viewer_id is part of viewer_state PK, comment_observation PK and every
+        sync_runs row, so anonymous and authenticated scopes never merge;
+        test_viewers_are_isolated_and_username_change_keeps_identity asserts
+        anonymous state for the authenticated discussion is None.
+      truncated: false
+  - id: A31
+    source: specs/sqlite-persistent-sync/spec.md
+    text: M2 的认证 session 仍是进程内一次性 session；持久化 viewer 身份不持久化 Cookie，也不能在后续进程中代替 nav
+      身份确认。
+    result: passed
+    reason:
+      text: schema has no cookie/session/auth columns and persist_discussion_sync only
+        receives the credential-free Viewer snapshot; M2 authentication remains
+        a process-local session (verified in adapter.py and documented in
+        README/architecture).
+      truncated: false
+  - id: A32
+    source: specs/sqlite-persistent-sync/spec.md
+    text: discussion 自然身份是 `(platform, object_type, oid, root_comment_id)`，与
+      viewer、username、focus_comment_id 和入口 URL 无关。`oid` 是平台对象 ID 的规范槽位；当前
+      Bilibili video discussion 中它与已解析 `aid` 同值。bvid、focus
+      和其他展示/定位信息可以作为可更新元数据保存，但不能改变自然身份。
+    result: passed
+    reason:
+      text: discussions UNIQUE(platform,object_type,oid,root_comment_id) (line 284);
+        _upsert_discussion uses aid as the oid slot (748-781) and only merges
+        bvid/focus_comment_id as updatable metadata;
+        DiscussionReference.identity excludes viewer/focus/URL (reference.py
+        64-67).
+      truncated: false
+  - id: A33
+    source: specs/sqlite-persistent-sync/spec.md
+    text: comments 属于 discussion，并以 `(discussion_id, platform_comment_id)`
+      唯一。重复页面、重复同步或不同 viewer 观察同一 comment 不能复制 comment fact 实体。
+    result: passed
+    reason:
+      text: comments has UNIQUE(discussion_id,comment_id) (line 302) and no viewer
+        column, so repeated pages/syncs or different viewers cannot duplicate a
+        comment fact; test_identical_snapshot_is_idempotent confirms comments
+        stay at 2 across two full syncs.
+      truncated: false
+  - id: A34
+    source: specs/sqlite-persistent-sync/spec.md
+    text: comment facts 至少保存规范化关系、作者、内容和平台时间：platform comment id、root id、parent
+      id、author id、author display name、content、created_at，以及当前 Comment
+      事实模型中与展示相关且不属于 viewer-relative 观察的字段。
+    result: passed
+    reason:
+      text: comments stores comment_id, author_id, username, content, root_id,
+        parent_id, created_at (integer), video_id and reply_count plus
+        created/updated_utc (lines 288-304);
+        test_comments_store_no_is_self_or_global_visibility asserts this
+        required field subset.
+      truncated: false
+  - id: A35
+    source: specs/sqlite-persistent-sync/spec.md
+    text: comments 不保存 `is_self`、单一全局 visibility、树节点、conversation
+      chain、Cookie/CSRF/header、请求 URL/query、分页游标或其他平台线协议字段。`is_self` 继续由
+      `comment.author_id == viewer.platform_user_id` 在输出或查询组装阶段派生；anonymous
+      或作者未知时为 null。
+    result: passed
+    reason:
+      text: comments has no is_self, global visibility, tree/conversation-chain,
+        cookie/header, request URL/query or cursor columns
+        (test_comments_store_no_is_self_or_global_visibility); derive_is_self
+        computes is_self at output time from author_id==viewer.platform_user_id
+        and returns None for anonymous/unknown (output.py 16-27).
+      truncated: false
+  - id: A36
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 本轮观察到的全部规范化 comment IDs 都属于 `observed_ids`，包括结构校验后仍保留的孤儿 facts；树与父链问题通过
+      diagnostics 表达，不通过静默丢弃 comment 改写 observed 集合。
+    result: passed
+    reason:
+      text: observed_ids is built from the full deduplicated result.comments (sync
+        151-152), which includes orphan facts; tree/parent problems stay as
+        output diagnostics and never drop comments from observed_ids
+        (test_relationship_conflict... asserts observed_ids [100,110] including
+        the conflicted comment).
+      truncated: false
+  - id: A37
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 未知占位值不得覆盖已保存的更完整事实；后续更完整观察可以回填未知值。关系冲突不得被静默覆盖，必须产生可审计错误并使最终 complete 判定为
+      false。
+    result: passed
+    reason:
+      text: "_upsert_comment applies placeholder-safe merge semantics: 0/empty
+        incoming values never overwrite stored facts, later complete values
+        backfill, and two conflicting real relationships keep the stored pair
+        with conflict=True (838-900); sync downgrades complete to False and
+        appends a fixed sanitized error diagnostic (183-185); covered by
+        test_placeholder_values_never_overwrite_stored_facts and
+        test_relationship_conflict_degrades_run_without_overwriting_or_baseline\
+        _change."
+      truncated: false
+  - id: A38
+    source: specs/sqlite-persistent-sync/spec.md
+    text: "`discussion_viewer_state` 唯一键为 `(discussion_id, viewer_id)`，至少保存
+      bound/tracked 状态、ever-seen 语义、最近一次完整同步引用和 last-complete visible baseline。"
+    result: passed
+    reason:
+      text: viewer_state (the discussion_viewer_state role) has PRIMARY KEY
+        (discussion_id,viewer_id) with bound_at, updated_at,
+        last_complete_sync_run_id and last_complete_visible_ids (333-343), plus
+        a composite FK validating the last-complete run scope; ever-seen
+        semantics are derived from the observation rows.
+      truncated: false
+  - id: A39
+    source: specs/sqlite-persistent-sync/spec.md
+    text: "`comment_observation` 唯一键为 `(discussion_id, viewer_id, comment_id)`，至少保存
+      `first_seen_at`、`last_seen_at` 和 `current_visibility`。"
+    result: passed
+    reason:
+      text: comment_observation PRIMARY KEY (discussion_id,viewer_id,comment_row_id)
+        with first_seen_at, last_seen_at, current_visibility (346-358);
+        comment_row_id is a 1:1 proxy for comment_id within the discussion
+        because comments enforces UNIQUE(discussion_id,comment_id), preserving
+        the specified unique-key semantics exactly.
+      truncated: false
+  - id: A40
+    source: specs/sqlite-persistent-sync/spec.md
+    text: "`current_visibility` 可以为空，表示该 comment 尚未进入任何完整
+      baseline，因而没有足够证据给出当前可见性结论；这包括首次只在 `complete=false` run 中观察到的
+      comment。非空合法值只有 `visible` 与 `not_currently_visible`。它只描述该 viewer 对该
+      discussion 的最近完整 baseline；不得出现 `unavailable`、`deleted` 或其他永久性结论。"
+    result: passed
+    reason:
+      text: current_visibility is nullable with CHECK IN
+        ('visible','not_currently_visible') (352-353); incomplete-run upserts
+        write NULL and never alter existing values (956-968); tests show NULL
+        for first-observed-in-incomplete comments and DB-level rejection of
+        'unavailable' (test_observation_visibility_check_rejects_unavailable).
+      truncated: false
+  - id: A41
+    source: specs/sqlite-persistent-sync/spec.md
+    text: ever-seen 在 `(discussion_id, viewer_id)` 作用域内单调增长。实现可以由 observations
+      推导或规范化存储，但查询 API 必须稳定返回相同语义，并由约束/事务保证不会回退。
+    result: passed
+    reason:
+      text: ever_seen is derived from comment_observation rows (930-942), which M3
+        never deletes, and each run merges observed ids, so the set only grows
+        within (discussion_id,viewer_id); test_complete_runs... and
+        test_incomplete_run... observe the monotonic [100]->[100,110]/[100,200]
+        growth.
+      truncated: false
+  - id: A42
+    source: specs/sqlite-persistent-sync/spec.md
+    text: first_seen 一经提交不得被后续同步改写；观察到 comment 时更新 last_seen。再次观察到此前
+      `not_currently_visible` 的 comment 时，它恢复为 `visible`，但 first_seen 保持不变。
+    result: passed
+    reason:
+      text: _upsert_observation ON CONFLICT updates only last_seen_at and
+        current_visibility, never first_seen_at (956-981); a complete run
+        re-observing a previously not_currently_visible comment writes visible
+        again; test_redetected_comment_restores_visible_but_keeps_first_seen
+        asserts both; retention of prior visibility during incomplete runs is
+        the A60 rule and is implemented consistently.
+      truncated: false
+  - id: A43
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 每次启用持久化的定向同步追加一个 sync run。run 至少关联 viewer 与 discussion，并记录开始/完成时间、最终
+      observed_ids、最终 complete、diagnostics，以及足以查询本轮 newly-observed 和 visibility
+      diff 的数据。
+    result: passed
+    reason:
+      text: sync_runs stores discussion_id, viewer_id, started_at, finished_at,
+        generated_at, complete, observed_ids, newly_observed_ids,
+        not_currently_visible_ids, previous_visible_ids and diagnostics
+        (308-322), inserted per run (1001-1040) and decoded by list_sync_runs.
+      truncated: false
+  - id: A44
+    source: specs/sqlite-persistent-sync/spec.md
+    text: persisted `complete` 必须与同一运行最终 schema 1.2 输出文档的 `complete` 完全一致，即经过
+      Adapter、分页、父链/建树等结构校验和输出期 error 复核后的最终值；不能在输出阶段还可能新增 error 时提前把 Adapter
+      的中间状态作为完整 baseline 提交。
+    result: passed
+    reason:
+      text: persist_discussion_sync reads complete/diagnostics/generated_at
+        exclusively from the final document and never result.complete (147-149,
+        docstring 135); a relationship conflict mutates document in place before
+        commit (257-258) so the persisted run equals the final emitted document;
+        tests
+        test_persisted_complete_diagnostics_and_generated_at_come_from_document
+        and
+        test_cli_database_persists_final_document_complete_not_result_complete
+        cover both directions.
+      truncated: false
+  - id: A45
+    source: specs/sqlite-persistent-sync/spec.md
+    text: diagnostics 使用现有脱敏结构语义持久化。它们不得包含 Cookie、headers、认证文件内容、未脱敏服务端 payload
+      或数据库绝对路径中的敏感内容。
+    result: passed
+    reason:
+      text: diagnostics are persisted verbatim from the already-sanitized output
+        document and sync appends only a fixed relationship_conflict dict with
+        empty details (40-58); no database path is injected;
+        test_persistence_errors_are_sanitized and corrupted-JSON tests assert no
+        secret/content leakage.
+      truncated: false
+  - id: A46
+    source: specs/sqlite-persistent-sync/spec.md
+    text: sync runs 是追加式审计事实。相同快照重复运行可以追加新的 run，但不得复制
+      viewer/discussion/comment/observation 实体，也不得产生虚假的 newly-observed 或
+      visibility diff。
+    result: passed
+    reason:
+      text: sync_runs are INSERT-only (no UPDATE/DELETE statements) and
+        test_identical_snapshot_is_idempotent shows a second identical run
+        appends a new ledger row with empty newly/diff while entity counts
+        remain unchanged.
+      truncated: false
+  - id: A47
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 对一个 `(viewer_id, discussion_id)`，每轮在同一事务中执行以下语义：
+    result: passed
+    reason:
+      text: All algorithm steps (viewer/discussion/state, ever-seen read, facts,
+        observations, run, baseline/diff) execute inside the single
+        _write_transaction context (sync 154-255).
+      truncated: false
+  - id: A48
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 读取事务开始时最近一次完整同步的 `last_complete_visible_ids`，记为
+      `previous_visible_ids`；没有完整 baseline 时为空集。
+    result: passed
+    reason:
+      text: sync reads viewer_state.last_complete_visible_ids inside the transaction
+        before modifying the baseline (192-198) and decodes NULL to an empty
+        set, matching 'no baseline => empty'.
+      truncated: false
+  - id: A49
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 对最终 FetchResult 中所有规范化 comments 形成 `observed_ids`，并读取提交前的
+      `ever_seen_before`。
+    result: passed
+    reason:
+      text: observed_ids is formed from all deduplicated result.comments (151-152) and
+        ever_seen_before is read before any observation upsert (164-166).
+      truncated: false
+  - id: A50
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 计算 `newly_observed = observed_ids - ever_seen_before`，把 observed_ids 并入
+      ever-seen；该步骤不依赖 complete。
+    result: passed
+    reason:
+      text: newly_observed_ids = sorted(set(observed_ids) - ever_seen_before) (line
+        167) is computed before and independently of the complete branch, and
+        observations are upserted for every observed id regardless of complete
+        (202-210).
+      truncated: false
+  - id: A51
+    source: specs/sqlite-persistent-sync/spec.md
+    text: upsert discussion/comment facts，并对本轮观察到的 comments 保留 first_seen、更新
+      last_seen。
+    result: passed
+    reason:
+      text: _upsert_discussion/_upsert_comment upsert facts (748-900) and
+        _upsert_observation preserves first_seen while refreshing last_seen for
+        every observed comment (202-210, 945-981).
+      truncated: false
+  - id: A52
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 如果最终 `complete=true`：
+    result: passed
+    reason:
+      text: The complete=true branch is gated on the final document complete value
+        (192) and executes the A53-A56 steps (192-223, 247-255).
+      truncated: false
+  - id: A53
+    source: specs/sqlite-persistent-sync/spec.md
+    text: "`current_visible_ids = observed_ids`；"
+    result: passed
+    reason:
+      text: "current_visible_ids equals observed_ids: the baseline written by
+        _update_viewer_state is observed_ids (254) and every observed comment is
+        marked visible (209)."
+      truncated: false
+  - id: A54
+    source: specs/sqlite-persistent-sync/spec.md
+    text: "`not_currently_visible_ids = previous_visible_ids - current_visible_ids`；"
+    result: passed
+    reason:
+      text: not_currently_visible_ids = sorted(set(previous_visible_ids) -
+        set(observed_ids)) (line 213), matching the spec formula exactly.
+      truncated: false
+  - id: A55
+    source: specs/sqlite-persistent-sync/spec.md
+    text: observed comments 的 current_visibility 写为 `visible`；差集中的 observations 只推进为
+      `not_currently_visible`；
+    result: passed
+    reason:
+      text: Observed comments receive current_visibility='visible' (209) and the diff
+        set is transitioned to 'not_currently_visible' only (984-998); tests
+        assert 100/120 visible and 110 not_currently_visible after the diff run.
+      truncated: false
+  - id: A56
+    source: specs/sqlite-persistent-sync/spec.md
+    text: last-complete baseline 原子替换为 current_visible_ids，并引用本轮 run。
+    result: passed
+    reason:
+      text: _update_viewer_state atomically writes last_complete_sync_run_id=run_id
+        and last_complete_visible_ids=observed_ids in the same transaction
+        (1043-1067), and the composite FK (341-342) guarantees the referenced
+        run belongs to the same discussion/viewer scope.
+      truncated: false
+  - id: A57
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 如果最终 `complete=false`：
+    result: passed
+    reason:
+      text: The complete=false branch is the else path of the same transaction
+        (199-200, 224-225, 1069-1072) and executes the A58-A60 semantics.
+      truncated: false
+  - id: A58
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 不替换 last-complete baseline；
+    result: passed
+    reason:
+      text: For incomplete runs previous_visible_ids stays None and
+        _update_viewer_state only refreshes updated_at (1069-1072), leaving
+        last_complete_sync_run_id/last_complete_visible_ids untouched;
+        test_incomplete_run_absorbs_observations_without_baseline_change asserts
+        baseline stays [100].
+      truncated: false
+  - id: A59
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 不计算或写入缺失、删除、unavailable 或 not-currently-visible 差集；
+    result: passed
+    reason:
+      text: Incomplete runs set not_currently_visible_ids=() and never call
+        _mark_not_currently_visible (224-225), so no missing/deleted/unavailable
+        inference is computed or written.
+      truncated: false
+  - id: A60
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 只提交 observed facts、ever-seen/first_seen/last_seen、新观察结果、run 与
+      diagnostics；既有 current_visibility 继续描述上一完整 baseline，首次仅在本轮观察到的 comment 保持
+      current_visibility 为空。
+    result: passed
+    reason:
+      text: Incomplete runs still commit facts, ever-seen/first/last seen, the run and
+        diagnostics, while observations are upserted with visibility=None so
+        existing current_visibility is preserved and first-time-observed
+        comments stay NULL (202-210, 956-968); test_incomplete_run... asserts
+        comment 200 stays NULL while comment 100 keeps visible.
+      truncated: false
+  - id: A61
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 完整且 observed_ids 为空是合法的 sync/storage 层集合语义：新 baseline 为空，上一完整 baseline 的全部
+      IDs 进入 `not_currently_visible`；这仍不证明永久删除。当前真实定向 Adapter
+      的有效完整结果通常至少含根评论，但该底层不变量仍必须可直接测试。首次完整同步以空 previous baseline 计算，所有 observed
+      IDs 都是 newly observed 且 visible。
+    result: passed
+    reason:
+      text: "An empty complete run is accepted: previous - empty yields the full prior
+        set as not_currently_visible and the baseline becomes []
+        (test_empty_complete_run_clears_baseline_conservatively); the
+        first-complete-run semantics (empty previous baseline, all observed
+        newly+visible) are asserted in
+        test_complete_runs_compute_newly_observed_and_visibility_diff."
+      truncated: false
+  - id: A62
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 一个 sync run 的原子提交单元包含 viewer/discussion state、comment
+      facts、observations、sync run、ever-seen 和（仅 complete 时）visibility
+      diff/baseline。任何约束、schema、锁定、I/O 或提交错误都必须回滚整个单元。
+    result: passed
+    reason:
+      text: The atomic unit spans viewer/discussion facts, observations, sync_run and
+        viewer_state/baseline in one transaction (sync 154-255);
+        test_fault_before_commit_rolls_back_entire_run proves a pre-commit
+        failure rolls back everything, and IntegrityError/lock/commit failures
+        all roll back via _write_transaction (595-613).
+      truncated: false
+  - id: A63
+    source: specs/sqlite-persistent-sync/spec.md
+    text: baseline 的 read-modify-write 必须防止两个并发进程以同一陈旧 baseline 覆盖彼此。实现可以串行化 writer
+      或使用条件更新，但最终提交顺序必须形成确定的完整 baseline 历史。
+    result: passed
+    reason:
+      text: BEGIN IMMEDIATE is acquired before any read-modify-write (589),
+        serializing writers so the second writer's snapshot includes the first
+        commit and cannot overwrite with a stale baseline; WAL plus a bounded
+        busy timeout bounds the wait; the concurrent-first-open race is
+        exercised by
+        test_concurrent_first_open_creates_schema_once_without_migration_error.
+      truncated: false
+  - id: A64
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 进程在事务任意位置崩溃后，重新打开数据库只能看到上一个完整提交或本轮完整提交，不得看到半份 sync run、半份 baseline 或缺少对应
+      run 的 observations。
+    result: passed
+    reason:
+      text: A run commits all-or-nothing via a single COMMIT; the before_commit fault
+        injection test rolls back and a reopened database shows only the prior
+        committed run with no half baseline/observations; SQLite WAL journaling
+        guarantees no partial transaction is visible.
+      truncated: false
+  - id: A65
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 数据库可以采用 WAL、busy timeout 与完整性 pragma；具体参数属于实现选择。超出允许等待仍无法取得锁时按持久化失败处理，不得跳过
+      ledger 后声称同步成功。
+    result: passed
+    reason:
+      text: _BUSY_TIMEOUT_MS=5000 (line 43) is applied, BEGIN IMMEDIATE lock
+        exhaustion is translated to the lock_timeout category (551-565) and
+        raises PersistenceError without committing a ledger;
+        test_lock_timeout_fails_closed_without_partial_run asserts category and
+        unchanged run/comment counts.
+      truncated: false
+  - id: A66
+    source: specs/sqlite-persistent-sync/spec.md
+    text: DB commit 是持久化同步的权威完成点。JSON stdout/导出是现有的次级展示：程序必须先构建并校验文档，再提交数据库，提交成功后才发布
+      JSON。SQLite 与 stdout/文件系统无法跨介质组成共同原子事务；若数据库已成功提交而后续 JSON 发布发生罕见 I/O
+      失败，数据库提交保持有效，CLI 仍按现有输出错误返回 exit 1，重试必须依靠同步幂等性安全收敛。
+    result: passed
+    reason:
+      text: CLI order is build document -> persist (commits inside) -> json.dumps ->
+        write stdout/file (cli 158-169);
+        test_cli_database_enabled_persists_final_document_before_write asserts
+        the fetch/build/persist/dump/write event order; OSError during output is
+        caught and returns 1 (183-185) while the committed DB remains, and retry
+        safety follows from the tested idempotent rerun semantics.
+      truncated: false
+  - id: A67
+    source: specs/sqlite-persistent-sync/spec.md
+    text: M3 提供稳定的 Python storage/query API，至少可以：
+    result: passed
+    reason:
+      text: The stable storage/query API exists and is exported (storage __all__
+        1301-1313) with the required capability set implemented by the A68-A72
+        functions.
+      truncated: false
+  - id: A68
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 按 viewer identity 与 discussion identity 查找实体和 tracked state；
+    result: passed
+    reason:
+      text: find_viewer and find_discussion resolve entities by stable identity, and
+        get_viewer_discussion_state returns the tracked state (storage
+        1075-1190).
+      truncated: false
+  - id: A69
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 列出/读取某 viewer 的 discussions，并以稳定顺序跨小时查询；
+    result: passed
+    reason:
+      text: list_viewer_discussions returns the viewer's tracked discussions ordered
+        by updated_at plus the natural-key tiebreakers (1101-1131), with
+        cross-hour ordering covered by the monkeypatched-clock test.
+      truncated: false
+  - id: A70
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 读取某 viewer/discussion 的 ever-seen、last complete baseline、current
+      observations；
+    result: passed
+    reason:
+      text: get_viewer_discussion_state returns ever_seen_ids,
+        last_complete_visible_ids, last_complete_sync_run_id and per-comment
+        observations in stable order (1134-1190).
+      truncated: false
+  - id: A71
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 读取 sync run 历史及单轮 observed/newly-observed/visibility
+      diff/complete/diagnostics；
+    result: passed
+    reason:
+      text: list_sync_runs returns per-run
+        observed/newly_observed/not_currently_visible/previous_visible/complete/diagnostics
+        in finished_at,id order (1193-1237).
+      truncated: false
+  - id: A72
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 读取规范化 comments 供后续树、上下文与 `is_self` 派生使用。
+    result: passed
+    reason:
+      text: list_comments returns viewer-independent normalized comment facts ordered
+        by (created_at, comment_id) (1240-1262) for future tree/context/is_self
+        derivation.
+      truncated: false
+  - id: A73
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 查询必须显式接受 viewer scope，不得把不同 mid 或 anonymous 的 observations
+      合并。稳定排序至少使用持久时间和内部稳定键打破并列。
+    result: passed
+    reason:
+      text: Every viewer-scoped query first resolves the viewer row and filters by
+        viewer_id (never merging mid/anonymous scopes), and all ORDER BY clauses
+        combine persistent time with internal stable keys;
+        test_query_api_is_viewer_scoped_and_stably_ordered asserts per-viewer
+        discussion isolation and run ordering.
+      truncated: false
+  - id: A74
+    source: specs/sqlite-persistent-sync/spec.md
+    text: API 不返回 Cookie、CSRF、headers、数据库连接对象或平台写参数；数据库内部主键不能替代平台稳定身份进入模型上下文。
+    result: passed
+    reason:
+      text: Query results are plain field dicts built without internal row ids or
+        connection objects (_comment_dict/_viewer_dict/_discussion_dict), and
+        storage contains no cookie/CSRF/header/write-parameter data or exposure.
+      truncated: false
+  - id: A75
+    source: specs/sqlite-persistent-sync/spec.md
+    text: M3 不增加最终用户查询 CLI，也不改变定向 JSON schema；M4/M5 在此 API 上定义其事件和上下文表面。
+    result: passed
+    reason:
+      text: build_parser adds no end-user query subcommand and the directed JSON
+        schema is unchanged
+        (test_cli_database_enabled_persists_final_document_before_write asserts
+        the forbidden-key set is absent); M4/M5 surfaces are left for later
+        milestones.
+      truncated: false
+  - id: A76
+    source: specs/sqlite-persistent-sync/spec.md
+    text: schema 包含可迁移的 `notification_sync_state`、`reply_events` 与
+      `outbound_replies/outbox` 基础实体，以避免 M4/M6 重新定义 ledger 身份；M3 不读取通知、不创建真实
+      reply events、不发送回复，也不驱动 outbox 状态机。
+    result: passed
+    reason:
+      text: Schema v1 includes notification_sync_state, reply_events and
+        outbound_replies (365-456); grep confirms no product code outside
+        storage.py reads notifications, creates reply events, sends replies or
+        drives an outbox state machine.
+      truncated: false
+  - id: A77
+    source: specs/sqlite-persistent-sync/spec.md
+    text: "`reply_event.target_availability` 的合法值是 `unknown / available /
+      unavailable`，并与 event status 使用独立列和独立约束。`unavailable` 永远不是
+      `comment_observation.current_visibility` 的值。"
+    result: passed
+    reason:
+      text: reply_events.target_availability CHECK IN
+        ('unknown','available','unavailable') (389-390) is a separate column
+        from event_status (391-392); comment_observation.current_visibility
+        CHECK excludes unavailable (352-353); tests
+        test_reply_event_target_availability_is_independent_of_status and
+        test_observation_visibility_check_rejects_unavailable cover both
+        constraints.
+      truncated: false
+  - id: A78
+    source: specs/sqlite-persistent-sync/spec.md
+    text: outbound/outbox 基础必须能在后续保存 idempotency key、target、content/hash、based-on
+      sync 与状态，但 M3 不接受 confirmed 记录、不执行发送，也不声称已经实现 M6 的完整状态机。
+    result: passed
+    reason:
+      text: outbound_replies stores idempotency_key UNIQUE, target_comment_id,
+        content, content_hash, based_on_sync_run_id and a seven-state status
+        CHECK (430-451); M3 product code has no outbox write path and performs
+        no send/confirmation, and
+        test_outbound_reply_statuses_and_target_natural_key_scope exercises the
+        schema foundation only.
+      truncated: false
+  - id: A79
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 提供 `--database` 后，数据库路径无效、打开失败、schema 不兼容、迁移失败、锁超时、约束冲突、事务失败或 commit
+      失败均为持久化致命错误：事务回滚，CLI exit 1，stdout 与目标输出文件均不产生本轮 JSON。
+    result: passed
+    reason:
+      text: Every fatal category
+        (open/schema/migration/lock/constraint/transaction/commit) maps to
+        PersistenceError and the CLI catches it before any JSON is built or
+        written, returning 1 (cli 158-185); tests cover directory-as-DB,
+        schema_too_new, lock_timeout, corrupted JSON columns, raw constraint
+        violations and commit-phase fault with no stdout/file output.
+      truncated: false
+  - id: A80
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 持久化错误使用固定、脱敏、可操作的错误类别；不得回显 SQL 中的私有评论内容、凭证、headers 或完整服务端 payload。
+    result: passed
+    reason:
+      text: _ERROR_MESSAGES is a fixed category-to-template map (63-79), _path_error
+        deliberately omits the path (86-94) and _translate_sqlite_error maps
+        failures to fixed categories (551-565); tests assert the secret,
+        database path and home directory name never appear in error text.
+      truncated: false
+  - id: A81
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 远端/结构同步本身 `complete=false` 但数据库事务成功时，必须按不完整同步规则持久化 run，随后继续输出现有 schema 1.2
+      JSON 并返回现有 exit 2。
+    result: passed
+    reason:
+      text: "test_cli_incomplete_result_with_database_writes_schema_1_2_and_returns_t\
+        wo: the incomplete result is persisted with complete False, schema 1.2
+        JSON is written and the CLI returns 2."
+      truncated: false
+  - id: A82
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 同一运行既是远端/结构 `complete=false` 又发生 SQLite 致命失败时，持久化 fail-closed 优先：事务回滚、exit
+      1 且无 JSON；不能因原本可返回 exit 2 而掩盖 ledger 未提交。
+    result: passed
+    reason:
+      text: Persistence failure raises before JSON construction/write in cli.main
+        (158-185), so fail-closed exit 1 wins even when the remote result would
+        have returned 2;
+        test_cli_database_persistence_error_exits_one_without_json_or_file
+        proves empty stdout, no output file and exit 1.
+      truncated: false
+  - id: A83
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 远端读取前的输入、认证、Cookie 文件或输出目标预检错误继续遵循现有 exit 1、无 JSON 行为。
+    result: passed
+    reason:
+      text: "Pre-read checks run before fetch/persist: existing output file without
+        --force (cli 132-135), cookie-file load/format errors (137-138, 83-96)
+        and adapter authentication failures; tests
+        test_cli_existing_output_returns_one_before_fetch,
+        test_cli_empty_cookie_file_exits_1_before_fetch and
+        test_cli_auth_failure_exits_1_without_json_on_stdout_or_disk assert exit
+        1 with no JSON."
+      truncated: false
+  - id: A84
+    source: specs/sqlite-persistent-sync/spec.md
+    text: 本能力不实现通知抓取、notification feed 缺席推断、reply event 发现与去重、LLM/MCP
+      上下文、意图或画像持久化、Writer、真实 outbox 状态转换、确认或发送、默认数据库发现、JSON 产品数据迁移、legacy
+      整视频持久化、平台抓取断点续传或凭证持久化。
+    result: passed
+    reason:
+      text: "Non-goals are absent from product code: no notification fetch/absence
+        inference, no reply-event discovery/dedup business, no LLM/MCP context,
+        no intent/profile persistence, no writer/send/confirmation, no default
+        DB discovery, no comments.json migration, legacy persistence is
+        rejected, no pagination-cursor persistence, and the schema has no
+        credential columns (verified by code reads and greps)."
+      truncated: false
+builder_handoff:
+  candidate_id: 2482fd30-93ec-4f85-a11f-99946896b8e0
+  identity_provider: skill-coordinated
+  builder_execution_ref: skill-coordinated:builder:e5576e6b-282e-4d7d-92e5-b5a4a5b4357f
+  iteration: 1
+  summary:
+    text: M3 SQLite 持久化同步候选完成：新增 storage.py/sync.py schema
+      v1、迁移/版本拒绝、事务/WAL/并发首建库、stable anonymous 与 authenticated viewer
+      隔离、discussion/comment facts、viewer state/observations/sync runs、完整/不完整
+      baseline/diff、关系冲突可审计降级、M4 reply_events 与 M6 outbound schema
+      基础、viewer-scoped query API；CLI 新增显式 --database PATH 并保持 schema
+      1.2/legacy/exit 语义；README 与长期文档已同步。
+    truncated: false
+  addressed_acceptance_ids:
+    - A1
+    - A2
+    - A3
+    - A4
+    - A5
+    - A6
+    - A7
+    - A8
+    - A9
+    - A10
+    - A11
+    - A12
+    - A13
+    - A14
+    - A15
+    - A16
+    - A17
+    - A18
+    - A19
+    - A20
+    - A21
+    - A22
+    - A23
+    - A24
+    - A25
+    - A26
+    - A27
+    - A28
+    - A29
+    - A30
+    - A31
+    - A32
+    - A33
+    - A34
+    - A35
+    - A36
+    - A37
+    - A38
+    - A39
+    - A40
+    - A41
+    - A42
+    - A43
+    - A44
+    - A45
+    - A46
+    - A47
+    - A48
+    - A49
+    - A50
+    - A51
+    - A52
+    - A53
+    - A54
+    - A55
+    - A56
+    - A57
+    - A58
+    - A59
+    - A60
+    - A61
+    - A62
+    - A63
+    - A64
+    - A65
+    - A66
+    - A67
+    - A68
+    - A69
+    - A70
+    - A71
+    - A72
+    - A73
+    - A74
+    - A75
+    - A76
+    - A77
+    - A78
+    - A79
+    - A80
+    - A81
+    - A82
+    - A83
+    - A84
+  checks:
+    - name:
+        text: uv run ruff format --check .
+        truncated: false
+      result: passed
+      note:
+        text: 73 files already formatted
+        truncated: false
+    - name:
+        text: uv run ruff check .
+        truncated: false
+      result: passed
+      note:
+        text: All checks passed
+        truncated: false
+    - name:
+        text: uv run pytest -q --cov=auto_comment_reply --cov-report=term-missing
+        truncated: false
+      result: passed
+      note:
+        text: 210 passed; total coverage 87%; storage 80%; sync 93%
+        truncated: false
+    - name:
+        text: git diff --check
+        truncated: false
+      result: passed
+      note:
+        text: No whitespace errors; only Git LF/CRLF advisory warnings
+        truncated: false
+  checks_truncated: false
+  known_limits:
+    - text: M3 持久化路径仅由离线自动化测试验证，未使用真实私人账号或真实网络 --database smoke。
+      truncated: false
+    - text: notification_sync_state、reply_events 与 outbound_replies 仅提供 M4/M6 schema
+        基础，不实现通知发现、LLM/MCP、确认或发送行为。
+      truncated: false
+    - text: SQLite 与 stdout/输出文件不是跨介质原子事务；DB commit 后罕见 JSON 发布 I/O 失败会保留
+        ledger，重试依靠幂等收敛。
+      truncated: false
+  known_limits_truncated: false
+  submitted_at: 2026-08-16T12:15:46.867Z
+blockers: []
+verification:
+  candidate_id: 2482fd30-93ec-4f85-a11f-99946896b8e0
+  identity_provider: skill-coordinated
+  verifier_execution_ref: skill-coordinated:verifier:950ae650-0c97-4153-817f-e021ea0f523d
+  iteration: 1
+  attempt: 1
+  assurance: skill-coordinated
+  verdict: pass
+  checks:
+    - id: ruff-format
+      name:
+        text: Ruff format check
+        truncated: false
+      argv_display:
+        - text: run
+          truncated: false
+        - text: ruff
+          truncated: false
+        - text: format
+          truncated: false
+        - text: --check
+          truncated: false
+        - text: .
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 154
+    - id: ruff-lint
+      name:
+        text: Ruff lint check
+        truncated: false
+      argv_display:
+        - text: run
+          truncated: false
+        - text: ruff
+          truncated: false
+        - text: check
+          truncated: false
+        - text: .
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 136
+    - id: pytest-coverage
+      name:
+        text: Pytest suite with coverage
+        truncated: false
+      argv_display:
+        - text: run
+          truncated: false
+        - text: pytest
+          truncated: false
+        - text: -q
+          truncated: false
+        - text: --cov=auto_comment_reply
+          truncated: false
+        - text: --cov-report=term-missing
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 3269
+  summary:
+    text: "Independent read-only verification of Comet Native change
+      m3-sqlite-sync-semantics (candidate 2482fd30-93ec-4f85-a11f-99946896b8e0,
+      stateVersion 4, iteration 1, attempt 1). I read the authoritative A1-A84
+      from `comet native status ... --json`, the full brief/spec, and (using
+      CodeGraph first, then targeted reads) storage.py, sync.py, cli.py,
+      __init__.py, models/output/reference/adapter, all three M3 test files plus
+      helpers, README and the three long-term docs. All 84 acceptance items
+      independently pass: schema v1 constraints and uniqueness,
+      single-transaction atomicity with fault-injection rollback/reopen,
+      complete/incomplete baseline and diff semantics, empty-complete and
+      idempotency, viewer/anonymous isolation and stable identities,
+      placeholder-safe merging with auditable relationship-conflict downgrade,
+      UTC/int64 fidelity, sanitized persistence errors, CLI --database gating
+      with legacy rejection and exit 0/1/2 precedence, and the viewer-scoped
+      stable query API. The three Runtime checks (ruff format/lint, pytest 210
+      passed at 87%) were not re-run; they were cross-checked against the tests
+      I read. Remaining risks are documented known limits or test-granularity
+      nuances rather than acceptance failures."
+    truncated: false
+  risks:
+    - text: M3 persistence is verified only by offline automated tests (MockTransport
+        + temp SQLite); no real private account or real network --database smoke
+        was performed. This is a documented, spec-consistent known limit, not an
+        acceptance failure.
+      truncated: false
+    - text: "SQLite and JSON stdout/file are not one cross-media atomic transaction:
+        if JSON publication fails after DB commit, the committed ledger remains
+        and the CLI exits 1; convergence relies on the tested idempotent rerun
+        semantics. Documented known limit."
+      truncated: false
+    - text: A63 has no automated multi-writer differing-snapshot race test;
+        correctness rests on BEGIN IMMEDIATE writer serialization verified by
+        code inspection, while the only concurrency test covers simultaneous
+        first-open schema creation.
+      truncated: false
+    - text: storage.py defines a transaction_start fault hook but tests only exercise
+        before_commit; docs/architecture.markdown phrases fault coverage as
+        transaction_start/before_commit, which slightly overstates the tested
+        points (mechanism exists and A2/A64 are still substantively covered).
+      truncated: false
+    - text: A42's 're-observation restores visible' applies within complete runs that
+        re-establish the baseline; incomplete runs intentionally retain the
+        last-complete-baseline visibility per A60. The implementation follows
+        the spec's algorithm section and this is consistent, but the two spec
+        sentences should be read together.
+      truncated: false
+    - text: notification_sync_state/reply_events/outbound_replies are schema-only
+        foundations; values such as 'confirmed'/'unavailable' are reachable only
+        via raw SQL in tests, with no M3 product API, matching the stated M4/M6
+        deferral.
+      truncated: false
+  risks_truncated: false
+  completed_at: 2026-08-16T12:29:21.695Z
+history:
+  - goal_cycle: 1
+    iteration: 1
+    attempt: 1
+    outcome: pass
+    unresolved_ids: []
+    summary:
+      text: "Independent read-only verification of Comet Native change
+        m3-sqlite-sync-semantics (candidate
+        2482fd30-93ec-4f85-a11f-99946896b8e0, stateVersion 4, iteration 1,
+        attempt 1). I read the authoritative A1-A84 from `comet native status
+        ... --json`, the full brief/spec, and (using CodeGraph first, then
+        targeted reads) storage.py, sync.py, cli.py, __init__.py,
+        models/output/reference/adapter, all three M3 test files plus helpers,
+        README and the three long-term docs. All 84 acceptance items
+        independently pass: schema v1 constraints and uniqueness,
+        single-transaction atomicity with fault-injection rollback/reopen,
+        complete/incomplete baseline and diff semantics, empty-complete and
+        idempotency, viewer/anonymous isolation and stable identities,
+        placeholder-safe merging with auditable relationship-conflict downgrade,
+        UTC/int64 fidelity, sanitized persistence errors, CLI --database gating
+        with legacy rejection and exit 0/1/2 precedence, and the viewer-scoped
+        stable query API. The three Runtime checks (ruff format/lint, pytest 210
+        passed at 87%) were not re-run; they were cross-checked against the
+        tests I read. Remaining risks are documented known limits or
+        test-granularity nuances rather than acceptance failures."
+      truncated: false
+    completed_at: 2026-08-16T12:29:21.695Z
+history_overflow:
+  dropped_entries: 0
+  first_dropped_at: null
+  last_dropped_at: null
+  outcome_counts:
+    pass: 0
+    fail: 0
+    blocked: 0
+    execution-error: 0
+    recovery: 0
+verification_result: pass
+verification_report: verification.md
+archived: true
+created_at: 2026-08-16T10:09:46.464Z

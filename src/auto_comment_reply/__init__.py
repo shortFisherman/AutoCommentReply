@@ -16,6 +16,7 @@ from .reference import (
     build_discussion_reference,
     parse_comment_reference,
 )
+from .sync import PersistenceError, SyncOutcome, persist_discussion_sync
 from .tree import CommentGraphError, TreeBuildResult, build_comment_forest, trace_to_root
 
 __all__ = [
@@ -28,12 +29,15 @@ __all__ = [
     "DiscussionReference",
     "FetchResult",
     "FetchStats",
+    "PersistenceError",
+    "SyncOutcome",
     "TreeBuildResult",
     "VideoInfo",
     "Viewer",
     "build_discussion_reference",
     "build_comment_forest",
     "parse_comment_reference",
+    "persist_discussion_sync",
     "trace_to_root",
 ]
 
